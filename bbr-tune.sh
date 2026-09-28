@@ -3,7 +3,7 @@
 # 目标：可审计、可预览、可回滚；不把 socket buffer 误当作限速器。
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -37,7 +37,7 @@ BUFFER_MAX_MIB="128"
 TARGET=""
 IPERF_SERVER=""
 SERVER_ADDRESS=""
-IPERF_PORT="5201"
+IPERF_PORT="0"
 DURATION="15"
 PARALLEL_STREAMS="1"
 PING_COUNT="20"
@@ -47,6 +47,11 @@ FORCE="0"
 ASSUME_YES="0"
 BACKUP_PATH=""
 AUTO_ROLLBACK_SECONDS="0"
+TARGET_UTILIZATION="90"
+MAX_RETRANS_PERCENT="1"
+MAX_ITERATIONS="4"
+TEST_WAIT_SECONDS="300"
+PERSIST_ON_SUCCESS="0"
 QUIET="0"
 
 RESOLVED_PROFILE=""
@@ -57,6 +62,11 @@ BDP_BYTES=""
 BDP_MIB=""
 SHAPER_MBPS=""
 TBF_BURST_BYTES=""
+TEST_RESULT_MBPS=""
+TEST_RESULT_BYTES=""
+TEST_RESULT_RETRANS=""
+TEST_RESULT_RETRANS_PERCENT=""
+CURRENT_TEST_PID=""
 
 log()  { (( QUIET )) || printf '%s\n' "$*"; }
 info() { log "[INFO] $*"; }
@@ -71,7 +81,8 @@ usage() {
   bbr-tune.sh probe    [探测参数]
   bbr-tune.sh plan     --bandwidth-mbps N --rtt-ms N [调优参数]
   bbr-tune.sh apply    --bandwidth-mbps N --rtt-ms N [调优参数]
-  bbr-tune.sh iperf-start  [--iperf-port 5201] [--server-address HOST]
+  bbr-tune.sh autotune --bandwidth-mbps N --rtt-ms N [闭环测试参数]
+  bbr-tune.sh iperf-start  [--iperf-port 0] [--server-address HOST]
   bbr-tune.sh iperf-status [--server-address HOST]
   bbr-tune.sh iperf-stop
   bbr-tune.sh confirm
@@ -80,9 +91,10 @@ usage() {
 
 命令：
   interactive 交互式向导；也可使用 menu 或 wizard 别名
-  probe       采集远程服务器内核、路由、qdisc 和 TCP 基线，不改配置
+  probe       检查服务器基线；缺少 iperf3 时自动安装，但不改 TCP/qdisc
   plan        计算 BDP、缓冲区、qdisc 和 sysctl 方案，不改配置
   apply       备份后应用配置；默认写入持久化文件并安装 systemd 服务
+  autotune    等待本地客户端测试，读取服务器端结果并迭代调参直到达标
   iperf-start 在本机（远程服务器）启动临时 iperf3 服务端
   iperf-status 查看 iperf3 服务状态并打印客户端测速命令
   iperf-stop  停止由本脚本启动的 iperf3 服务端
@@ -107,10 +119,19 @@ usage() {
   --auto-rollback-seconds N 远程变更后 N 秒未 confirm 则自动回滚；0 表示禁用
   --yes                   非交互确认 apply/rollback
 
+闭环测试参数：
+  --target-utilization N  达标吞吐占目标带宽的百分比，默认 90
+  --max-retrans-percent N 允许的估算重传比例，默认 1%
+  --max-iterations N      最大自动调参轮数，默认 4
+  --test-wait-seconds N   每轮等待本地客户端连接的秒数，默认 300
+  --parallel N            达标测试使用的并发流数，默认 1
+  --duration N            每轮测试时长，默认 15 秒
+  --persist-on-success    达标后把最终服务器参数持久化
+
 服务端探测与测速参数：
   --target HOST           从服务器执行可选的外部 ping，仅用于出口诊断
   --server-address HOST   打印给本地客户端使用的服务器公网 IP/域名
-  --iperf-port N          服务端监听端口，默认 5201
+  --iperf-port N          服务端监听端口；默认 0，自动选择未占用的随机端口
   --ping-count N          默认 20
 
 注意：本脚本运行在远程服务器。iperf3 的 -c/-R 命令应在你的本地客户端执行，
@@ -119,9 +140,9 @@ usage() {
 示例：
   sudo ./bbr-tune.sh
   ./bbr-tune.sh probe --target 1.1.1.1 --server-address speed.example.com
-  sudo ./bbr-tune.sh iperf-start --iperf-port 5201 --server-address speed.example.com
+  sudo ./bbr-tune.sh iperf-start --iperf-port 0 --server-address speed.example.com
   ./bbr-tune.sh plan --profile hard-cap --cap-mbps 200 --bandwidth-mbps 200 --rtt-ms 30
-  sudo ./bbr-tune.sh apply --profile hard-cap --cap-mbps 200 --bandwidth-mbps 200 --rtt-ms 30 --runtime-only --auto-rollback-seconds 300 --yes
+  sudo ./bbr-tune.sh autotune --profile auto --bandwidth-mbps 1000 --rtt-ms 180 --parallel 8 --server-address speed.example.com
   sudo ./bbr-tune.sh confirm
   ./bbr-tune.sh verify
   sudo ./bbr-tune.sh rollback --yes
@@ -173,6 +194,11 @@ parse_args() {
       --ping-count) need_arg "$@"; PING_COUNT="$2"; shift 2 ;;
       --backup) need_arg "$@"; BACKUP_PATH="$2"; shift 2 ;;
       --auto-rollback-seconds) need_arg "$@"; AUTO_ROLLBACK_SECONDS="$2"; shift 2 ;;
+      --target-utilization) need_arg "$@"; TARGET_UTILIZATION="$2"; shift 2 ;;
+      --max-retrans-percent) need_arg "$@"; MAX_RETRANS_PERCENT="$2"; shift 2 ;;
+      --max-iterations) need_arg "$@"; MAX_ITERATIONS="$2"; shift 2 ;;
+      --test-wait-seconds) need_arg "$@"; TEST_WAIT_SECONDS="$2"; shift 2 ;;
+      --persist-on-success) PERSIST_ON_SUCCESS="1"; shift ;;
       --runtime-only) PERSIST="0"; shift ;;
       --allow-buffer-shrink) ALLOW_BUFFER_SHRINK="1"; shift ;;
       --force) FORCE="1"; shift ;;
@@ -198,13 +224,21 @@ validate_common_options() {
   is_integer "$PARALLEL_STREAMS" || die "--parallel 必须是整数"
   is_integer "$PING_COUNT" || die "--ping-count 必须是整数"
   is_integer "$AUTO_ROLLBACK_SECONDS" || die "--auto-rollback-seconds 必须是整数"
+  is_number "$TARGET_UTILIZATION" || die "--target-utilization 必须是数字"
+  is_number "$MAX_RETRANS_PERCENT" || die "--max-retrans-percent 必须是数字"
+  is_integer "$MAX_ITERATIONS" || die "--max-iterations 必须是整数"
+  is_integer "$TEST_WAIT_SECONDS" || die "--test-wait-seconds 必须是整数"
 
   awk -v v="$HEADROOM_PERCENT" 'BEGIN { exit !(v > 0 && v < 100) }' || die "headroom 必须在 0 与 100 之间"
   awk -v v="$BUFFER_FACTOR" 'BEGIN { exit !(v >= 1.0 && v <= 4.0) }' || die "buffer-factor 建议并限制在 1.0~4.0"
   (( BUFFER_MAX_MIB >= 2 )) || die "buffer-max-mib 至少为 2"
-  (( IPERF_PORT >= 1 && IPERF_PORT <= 65535 )) || die "iperf 端口范围应为 1~65535"
+  (( IPERF_PORT >= 0 && IPERF_PORT <= 65535 )) || die "iperf 端口必须为 0（自动随机）或 1~65535"
   (( DURATION >= 1 && PARALLEL_STREAMS >= 1 && PING_COUNT >= 1 )) || die "探测计数必须大于 0"
   (( AUTO_ROLLBACK_SECONDS == 0 || (AUTO_ROLLBACK_SECONDS >= 30 && AUTO_ROLLBACK_SECONDS <= 86400) )) || die "自动回滚时间必须为 0，或在 30~86400 秒之间"
+  awk -v v="$TARGET_UTILIZATION" 'BEGIN { exit !(v > 0 && v <= 100) }' || die "target-utilization 必须在 0~100 之间"
+  awk -v v="$MAX_RETRANS_PERCENT" 'BEGIN { exit !(v >= 0 && v <= 100) }' || die "max-retrans-percent 必须在 0~100 之间"
+  (( MAX_ITERATIONS >= 1 && MAX_ITERATIONS <= 10 )) || die "max-iterations 必须在 1~10 之间"
+  (( TEST_WAIT_SECONDS >= 30 && TEST_WAIT_SECONDS <= 3600 )) || die "test-wait-seconds 必须在 30~3600 秒之间"
 }
 
 require_linux() {
@@ -507,10 +541,63 @@ current_iperf_port() {
   fi
 }
 
+install_iperf3_if_needed() {
+  have iperf3 && return 0
+  require_root
+  info "未检测到 iperf3，正在根据服务器发行版自动安装"
+
+  if have apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y iperf3
+  elif have dnf; then
+    dnf install -y iperf3
+  elif have yum; then
+    yum install -y iperf3
+  elif have zypper; then
+    zypper --non-interactive install iperf3
+  elif have apk; then
+    apk add --no-cache iperf3
+  elif have pacman; then
+    pacman -Sy --noconfirm iperf3
+  else
+    die "无法识别服务器包管理器，请手动安装 iperf3 后重试"
+  fi
+
+  have iperf3 || die "已调用包管理器，但仍未找到 iperf3"
+  info "iperf3 安装完成：$(iperf3 --version 2>/dev/null | head -1)"
+}
+
+port_is_free() {
+  local port="$1" listeners
+  listeners="$(ss -H -ltn 2>/dev/null)" || die "无法读取服务器 TCP 监听端口"
+  if awk -v target="$port" '{
+    local_addr=$4
+    sub(/^.*:/, "", local_addr)
+    if (local_addr == target) found=1
+  } END {exit !found}' <<<"$listeners"; then
+    return 1
+  fi
+  return 0
+}
+
+choose_random_free_port() {
+  local port attempt
+  for ((attempt=1; attempt<=200; attempt++)); do
+    port=$((20000 + (((RANDOM << 15) | RANDOM) % 40000)))
+    if port_is_free "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  die "尝试 200 次后仍无法找到未占用的随机 TCP 端口"
+}
+
 iperf_server_start() {
   require_linux
   require_root
-  require_cmds iperf3 ss nohup grep
+  require_cmds ss nohup grep
+  install_iperf3_if_needed
   local pid address active_port
   mkdir -p "$IPERF_RUN_DIR"
   chmod 0755 "$IPERF_RUN_DIR"
@@ -522,9 +609,13 @@ iperf_server_start() {
     print_client_iperf_commands "$address" "$active_port"
     return 0
   fi
-  rm -f "$IPERF_PID_FILE"
+  rm -f "$IPERF_PID_FILE" "$IPERF_PORT_FILE"
+  if (( IPERF_PORT == 0 )); then
+    IPERF_PORT="$(choose_random_free_port)"
+    info "已自动选择未占用的随机端口：${IPERF_PORT}"
+  fi
 
-  if ss -H -ltn "sport = :${IPERF_PORT}" 2>/dev/null | grep -q .; then
+  if ! port_is_free "$IPERF_PORT"; then
     die "TCP ${IPERF_PORT} 端口已被占用；请更换 --iperf-port 或检查现有服务"
   fi
 
@@ -551,17 +642,15 @@ iperf_server_status() {
   require_linux
   local pid address active_port
   address="$(guess_server_address)"
-  active_port="$(current_iperf_port)"
   if pid="$(iperf_server_pid 2>/dev/null)"; then
+    active_port="$(current_iperf_port)"
     printf 'iperf3_status=running\niperf3_pid=%s\niperf3_port=%s\n' "$pid" "$active_port"
     have ss && ss -ltnp 2>/dev/null | awk -v p=":${active_port}" '$4 ~ p"$" {print}' || true
+    print_client_iperf_commands "$address" "$active_port"
   else
     printf 'iperf3_status=stopped\n'
-    if have ss && ss -H -ltn "sport = :${IPERF_PORT}" 2>/dev/null | grep -q .; then
-      warn "端口 ${IPERF_PORT} 有监听进程，但不是本脚本记录的 iperf3 进程"
-    fi
+    info "请运行 iperf-start；脚本会自动安装 iperf3 并随机选择空闲端口"
   fi
-  print_client_iperf_commands "$address" "$active_port"
 }
 
 iperf_server_stop() {
@@ -586,6 +675,7 @@ iperf_server_stop() {
 probe() {
   require_linux
   require_cmds ip sysctl tc uname awk
+  install_iperf3_if_needed
   [[ -z "$IPERF_SERVER" ]] || die "--iperf-server 已停用：远程服务器应运行 iperf3 -s；请在本地客户端执行 iperf3 -c ... -R"
   local iface
   iface="$(resolve_iface)"
@@ -626,11 +716,11 @@ probe() {
   if iperf_server_pid >/dev/null 2>&1; then
     log ""
     log "iperf3 服务端状态：running"
+    print_client_iperf_commands "$(guess_server_address)" "$(current_iperf_port)"
   else
     log ""
-    log "iperf3 服务端状态：stopped（可运行：sudo ./${PROGRAM} iperf-start）"
+    log "iperf3 服务端状态：stopped（启动时会自动选择随机空闲端口）"
   fi
-  print_client_iperf_commands "$(guess_server_address)" "$(current_iperf_port)"
 }
 
 root_qdisc_kind() {
@@ -987,6 +1077,383 @@ pending_rollback_guard() {
   fi
 }
 
+parse_iperf_server_json() {
+  local json_file="$1" values bps bytes retrans error_text
+
+  # 不额外安装 jq：优先使用服务器已有的 Python 3，否则解析 iperf3 -J 的
+  # 稳定 pretty-print 结构。这样除用户明确要求的 iperf3 外不安装其他软件包。
+  if have python3; then
+    values="$(python3 - "$json_file" <<'PY_JSON'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    sent = data["end"]["sum_sent"]
+    print(f'{sent.get("bits_per_second", 0)}\t{sent.get("bytes", 0)}\t{sent.get("retransmits", 0)}')
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(1)
+PY_JSON
+)" || return 1
+  else
+    values="$(awk '
+      /"sum_sent"[[:space:]]*:/ { in_sum=1; next }
+      in_sum && /"bits_per_second"[[:space:]]*:/ {
+        v=$0; sub(/^.*:[[:space:]]*/, "", v); sub(/,[[:space:]]*$/, "", v); bps=v
+      }
+      in_sum && /"bytes"[[:space:]]*:/ {
+        v=$0; sub(/^.*:[[:space:]]*/, "", v); sub(/,[[:space:]]*$/, "", v); bytes=v
+      }
+      in_sum && /"retransmits"[[:space:]]*:/ {
+        v=$0; sub(/^.*:[[:space:]]*/, "", v); sub(/,[[:space:]]*$/, "", v); retrans=v
+      }
+      in_sum && /^[[:space:]]*}/ {
+        if (bps != "") {
+          if (bytes == "") bytes=0
+          if (retrans == "") retrans=0
+          print bps "\t" bytes "\t" retrans
+          exit
+        }
+      }
+    ' "$json_file")"
+  fi
+
+  if [[ -z "$values" ]]; then
+    error_text="$(awk '
+      /"error"[[:space:]]*:/ {
+        v=$0; sub(/^.*:[[:space:]]*/, "", v); sub(/,[[:space:]]*$/, "", v); gsub(/^"|"$/, "", v); print v; exit
+      }
+    ' "$json_file")"
+    [[ -n "$error_text" ]] && warn "iperf3：${error_text}"
+    warn "iperf3 JSON 中没有有效的 end.sum_sent 测试结果"
+    return 1
+  fi
+
+  IFS=$'\t' read -r bps bytes retrans <<<"$values"
+  is_number "$bps" && is_number "$bytes" && is_number "$retrans" || {
+    warn "iperf3 JSON 测试结果不是有效数字"
+    return 1
+  }
+  TEST_RESULT_MBPS="$(awk -v v="$bps" 'BEGIN {printf "%.2f", v/1000000}')"
+  TEST_RESULT_BYTES="$(awk -v v="$bytes" 'BEGIN {printf "%.0f", v}')"
+  TEST_RESULT_RETRANS="$(awk -v v="$retrans" 'BEGIN {printf "%.0f", v}')"
+  TEST_RESULT_RETRANS_PERCENT="$(awk -v r="$TEST_RESULT_RETRANS" -v b="$TEST_RESULT_BYTES" \
+    'BEGIN {if (b<=0) print "100.0000"; else printf "%.4f", r*1448/b*100}')"
+}
+
+abort_current_test_signal() {
+  trap - INT TERM
+  set +e
+  if [[ -n "$CURRENT_TEST_PID" ]]; then
+    kill "$CURRENT_TEST_PID" 2>/dev/null || true
+    wait "$CURRENT_TEST_PID" 2>/dev/null || true
+    CURRENT_TEST_PID=""
+  fi
+  warn "收到中断信号，已停止服务器端临时 iperf3 测试；尚未修改 BBR 参数"
+  exit 130
+}
+
+run_reverse_test() {
+  local session_dir="$1" label="$2" address="$3" port="$4" streams="$5" duration="$6" wait_seconds="$7"
+  local json_file="${session_dir}/${label}.json" err_file="${session_dir}/${label}.err"
+  local elapsed=0 rc=0
+
+  port_is_free "$port" || die "测试端口 ${port} 当前被占用"
+  : >"$json_file"
+  : >"$err_file"
+  iperf3 -s -1 -J -p "$port" >"$json_file" 2>"$err_file" &
+  CURRENT_TEST_PID=$!
+  sleep 1
+  kill -0 "$CURRENT_TEST_PID" 2>/dev/null || {
+    cat "$err_file" >&2 || true
+    CURRENT_TEST_PID=""
+    die "iperf3 一次性服务端启动失败"
+  }
+
+  cat <<EOF_TEST
+
+================================================================
+服务器已等待第 ${label} 次本地测试，随机端口：${port}
+请在你的本地电脑执行以下命令；脚本不会修改本地任何参数：
+
+  iperf3 -c ${address} -p ${port} -R -P ${streams} -t ${duration} -i 1
+
+如果无法连接，请检查云安全组和服务器防火墙是否允许 TCP ${port}。
+服务器最多等待 ${wait_seconds} 秒。
+================================================================
+EOF_TEST
+
+  while kill -0 "$CURRENT_TEST_PID" 2>/dev/null; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if (( elapsed % 15 == 0 )); then
+      info "仍在等待本地客户端连接或测试完成，已等待 ${elapsed}s"
+    fi
+    if (( elapsed >= wait_seconds )); then
+      kill "$CURRENT_TEST_PID" 2>/dev/null || true
+      wait "$CURRENT_TEST_PID" 2>/dev/null || true
+      CURRENT_TEST_PID=""
+      warn "等待本地客户端测试超时"
+      return 124
+    fi
+  done
+
+  set +e
+  wait "$CURRENT_TEST_PID"
+  rc=$?
+  set -e
+  CURRENT_TEST_PID=""
+  if (( rc != 0 )); then
+    cat "$err_file" >&2 || true
+    return "$rc"
+  fi
+  parse_iperf_server_json "$json_file"
+  printf '测试结果：吞吐=%s Mbps，Retr=%s，估算重传比例=%s%%\n' \
+    "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT"
+}
+
+test_result_speed_low() {
+  local min_mbps
+  min_mbps="$(awk -v bw="$BANDWIDTH_MBPS" -v p="$TARGET_UTILIZATION" 'BEGIN {printf "%.4f", bw*p/100}')"
+  awk -v speed="$TEST_RESULT_MBPS" -v min="$min_mbps" 'BEGIN {exit !(speed < min)}'
+}
+
+test_result_retrans_high() {
+  awk -v retrans="$TEST_RESULT_RETRANS_PERCENT" -v maxr="$MAX_RETRANS_PERCENT" \
+    'BEGIN {exit !(retrans > maxr)}'
+}
+
+test_result_meets_target() {
+  ! test_result_speed_low && ! test_result_retrans_high
+}
+
+next_buffer_factor() {
+  awk -v f="$1" 'BEGIN {
+    if (f < 1.5) print "2.0";
+    else if (f < 2.5) print "3.0";
+    else if (f < 4.0) print "4.0";
+    else print f;
+  }'
+}
+
+increase_effective_buffer_factor() {
+  local old_factor="$BUFFER_FACTOR" old_bytes="$BUFFER_BYTES" candidate
+
+  while true; do
+    candidate="$(next_buffer_factor "$BUFFER_FACTOR")"
+    if [[ "$candidate" == "$BUFFER_FACTOR" ]]; then
+      BUFFER_FACTOR="$old_factor"
+      calculate_plan
+      adjust_for_existing_buffers
+      return 1
+    fi
+
+    BUFFER_FACTOR="$candidate"
+    calculate_plan
+    adjust_for_existing_buffers
+    if (( BUFFER_BYTES > old_bytes )); then
+      return 0
+    fi
+  done
+}
+
+minimum_headroom_percent() {
+  awk -v target="$TARGET_UTILIZATION" 'BEGIN {
+    floor=int(target + 2.999999);
+    target_ceil=int(target); if (target_ceil < target) target_ceil++;
+    if (floor > 98) floor=98;
+    if (floor < target_ceil) floor=target_ceil;
+    if (floor > 99) floor=99;
+    printf "%.0f", floor;
+  }'
+}
+
+configure_hard_cap_candidate() {
+  local floor
+  PROFILE="hard-cap"
+  SYMPTOM="hard-cap"
+  [[ -n "$CAP_MBPS" ]] || CAP_MBPS="$BANDWIDTH_MBPS"
+  floor="$(minimum_headroom_percent)"
+  if awk -v h="$HEADROOM_PERCENT" -v f="$floor" 'BEGIN {exit !(h < f)}'; then
+    HEADROOM_PERCENT="$floor"
+  fi
+}
+
+prepare_initial_autotune_candidate() {
+  if test_result_retrans_high; then
+    configure_hard_cap_candidate
+    info "基线重传高于 ${MAX_RETRANS_PERCENT}%：首轮启用服务器端 TBF 预整形（${HEADROOM_PERCENT}%）+ BBR/fq"
+  elif test_result_speed_low; then
+    info "基线重传可接受但吞吐不足：首轮按 RTT/BDP 应用 BBR/fq 与缓冲区方案"
+  fi
+}
+
+adjust_autotune_candidate() {
+  local floor new_headroom previous_factor new_factor
+
+  if test_result_retrans_high; then
+    if [[ "$RESOLVED_PROFILE" != "hard-cap" ]]; then
+      configure_hard_cap_candidate
+      info "重传仍偏高：下一轮切换为服务器端 hard-cap 预整形，比例 ${HEADROOM_PERCENT}%"
+      return 0
+    fi
+
+    floor="$(minimum_headroom_percent)"
+    new_headroom="$(awk -v h="$HEADROOM_PERCENT" -v floor="$floor" \
+      'BEGIN {n=int(h-3); if(n<floor)n=floor; printf "%.0f", n}')"
+    if awk -v old="$HEADROOM_PERCENT" -v new="$new_headroom" 'BEGIN {exit !(new < old)}'; then
+      HEADROOM_PERCENT="$new_headroom"
+      info "重传仍偏高：下一轮把服务器 TBF 整形比例降至 ${HEADROOM_PERCENT}%"
+      return 0
+    fi
+
+    warn "重传仍高于阈值，但整形比例已到 ${floor}% 安全下限；继续降低将无法满足目标吞吐"
+    return 1
+  fi
+
+  if test_result_speed_low; then
+    previous_factor="$BUFFER_FACTOR"
+    if increase_effective_buffer_factor; then
+      new_factor="$BUFFER_FACTOR"
+      info "重传已受控但吞吐未达标：下一轮把服务器 BDP 缓冲系数从 ${previous_factor} 提高至 ${new_factor}（buffer=${BUFFER_BYTES}）"
+      return 0
+    fi
+    warn "吞吐仍未达标，但继续提高 BDP 系数不会增大当前有效缓冲上限"
+  fi
+
+  return 1
+}
+
+persist_current_tuning() {
+  local iface="$1"
+  have systemctl || die "系统没有 systemd，无法按本脚本方式持久化最终参数"
+  PERSIST=1
+  apply_sysctls_runtime
+  write_persistent_files "$iface"
+  systemctl daemon-reload
+  systemctl enable bbr-tcp-tuning.service >/dev/null
+  systemctl restart bbr-tcp-tuning.service
+}
+
+autotune_session() {
+  require_linux
+  require_root
+  require_cmds ip tc sysctl modprobe awk mktemp ss grep
+  pending_rollback_guard
+  [[ -n "$BANDWIDTH_MBPS" && -n "$RTT_MS" ]] || die "autotune 需要 --bandwidth-mbps 和 --rtt-ms"
+  install_iperf3_if_needed
+
+  local iface address port session_dir report_file backup="" root_kind
+  local round success=0 candidate_note
+  local min_mbps
+  iface="$(resolve_iface)"
+  ip link show dev "$iface" >/dev/null 2>&1 || die "网卡不存在：$iface"
+  address="$(guess_server_address)"
+  port="$(choose_random_free_port)"
+  session_dir="${STATE_DIR}/autotune/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$session_dir"
+  report_file="${session_dir}/results.tsv"
+  printf 'round\tprofile\tbuffer_factor\theadroom\tbuffer_bytes\tmbps\tretrans\tretrans_percent\tpassed\n' >"$report_file"
+  min_mbps="$(awk -v bw="$BANDWIDTH_MBPS" -v p="$TARGET_UTILIZATION" 'BEGIN {printf "%.2f", bw*p/100}')"
+
+  cat <<EOF_SESSION
+=== 服务器端自动闭环调优 ===
+服务器地址：${address}
+随机测试端口：${port}
+目标带宽：${BANDWIDTH_MBPS} Mbps
+达标吞吐：>= ${min_mbps} Mbps（${TARGET_UTILIZATION}%）
+最大估算重传比例：${MAX_RETRANS_PERCENT}%
+测试并发流：${PARALLEL_STREAMS}
+最大调参轮数：${MAX_ITERATIONS}
+结果目录：${session_dir}
+
+注意：脚本只修改这台服务器。你的本地电脑只运行 iperf3 测试命令。
+EOF_SESSION
+  warn "请确保云安全组/服务器防火墙允许本次随机 TCP 端口 ${port}"
+
+  info "先执行基线测试；基线达标时不会修改任何服务器参数"
+  trap abort_current_test_signal INT TERM
+  run_reverse_test "$session_dir" baseline "$address" "$port" "$PARALLEL_STREAMS" "$DURATION" "$TEST_WAIT_SECONDS"
+  printf '0\tbaseline\t-\t-\t-\t%s\t%s\t%s\t%s\n' \
+    "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT" \
+    "$(test_result_meets_target && echo yes || echo no)" >>"$report_file"
+
+  if test_result_meets_target; then
+    trap - INT TERM
+    info "基线已经达到条件，无需修改服务器 BBR 参数"
+    info "测试报告：$report_file"
+    return 0
+  fi
+
+  prepare_initial_autotune_candidate
+  calculate_plan
+  adjust_for_existing_buffers
+  ensure_bbr_available
+  root_kind="$(root_qdisc_kind "$iface")"
+  if ! qdisc_is_safe_to_replace "$root_kind" && (( ! FORCE )); then
+    die "检测到自定义 root qdisc '${root_kind}'，自动调优拒绝覆盖；审计后可使用 --force"
+  fi
+
+  trap - INT TERM
+  backup="$(create_backup "$iface")"
+  info "自动调优基线备份：$backup"
+  if (( AUTO_ROLLBACK_SECONDS == 0 )); then
+    AUTO_ROLLBACK_SECONDS=$(( TEST_WAIT_SECONDS * (MAX_ITERATIONS + 1) + 600 ))
+    (( AUTO_ROLLBACK_SECONDS > 86400 )) && AUTO_ROLLBACK_SECONDS=86400
+  fi
+  trap 'auto_rollback_on_error "$backup"' ERR
+  trap 'auto_rollback_signal "$backup"' INT TERM
+  schedule_remote_rollback "$backup"
+  PERSIST=0
+
+  for ((round=1; round<=MAX_ITERATIONS; round++)); do
+    calculate_plan
+    adjust_for_existing_buffers
+    candidate_note="profile=${RESOLVED_PROFILE}, factor=${BUFFER_FACTOR}, buffer=${BUFFER_BYTES}, headroom=${HEADROOM_PERCENT}%"
+    info "第 ${round}/${MAX_ITERATIONS} 轮应用服务器参数：${candidate_note}"
+    apply_sysctls_runtime
+    apply_qdisc_runtime "$iface"
+
+    run_reverse_test "$session_dir" "round-${round}" "$address" "$port" "$PARALLEL_STREAMS" "$DURATION" "$TEST_WAIT_SECONDS"
+    if test_result_meets_target; then
+      success=1
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tyes\n' \
+        "$round" "$RESOLVED_PROFILE" "$BUFFER_FACTOR" "$HEADROOM_PERCENT" "$BUFFER_BYTES" \
+        "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT" >>"$report_file"
+      break
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tno\n' \
+      "$round" "$RESOLVED_PROFILE" "$BUFFER_FACTOR" "$HEADROOM_PERCENT" "$BUFFER_BYTES" \
+      "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT" >>"$report_file"
+
+    if ! adjust_autotune_candidate; then
+      warn "已没有可继续安全自动调整的服务器参数，提前结束"
+      break
+    fi
+  done
+
+  if (( success == 0 )); then
+    trap - ERR INT TERM
+    warn "在最大轮数内未同时满足吞吐和重传条件，正在恢复服务器基线"
+    cancel_pending_for_backup "$backup"
+    restore_backup_internal "$backup"
+    info "测试报告：$report_file"
+    return 2
+  fi
+
+  if (( PERSIST_ON_SUCCESS )); then
+    info "测试达标，正在持久化最终服务器参数"
+    persist_current_tuning "$iface"
+  fi
+  trap - ERR INT TERM
+  info "自动调优达标：${TEST_RESULT_MBPS} Mbps，估算重传 ${TEST_RESULT_RETRANS_PERCENT}%"
+  info "最终参数：profile=${RESOLVED_PROFILE}, factor=${BUFFER_FACTOR}, buffer=${BUFFER_BYTES}, headroom=${HEADROOM_PERCENT}%"
+  info "测试报告：$report_file"
+  warn "请另开 SSH 会话验证服务器；确认正常后执行：sudo $PROGRAM confirm"
+}
+
 apply_tuning() {
   require_linux
   require_root
@@ -1162,6 +1629,17 @@ auto_rollback_on_error() {
     warn "自动回滚完成"
   fi
   exit "$rc"
+}
+
+auto_rollback_signal() {
+  local backup="$1"
+  trap - ERR INT TERM
+  set +e
+  [[ -n "$CURRENT_TEST_PID" ]] && kill "$CURRENT_TEST_PID" 2>/dev/null || true
+  warn "收到中断信号，正在恢复服务器基线：$backup"
+  cancel_pending_for_backup "$backup"
+  restore_backup_internal "$backup"
+  exit 130
 }
 
 rollback() {
@@ -1540,14 +2018,14 @@ interactive_probe_wizard() {
     ping_count="$REPLY_VALUE"
     args+=(--target "$target" --ping-count "$ping_count")
   fi
-  interactive_run_script 0 probe "${args[@]}" || true
+  interactive_run_script 1 probe "${args[@]}" || true
 }
 
 interactive_iperf_wizard() {
-  local choice port address default_address=""
+  local choice address default_address=""
   ui_header "远程服务器 iperf3 测速服务"
   cat <<'EOF_IPERF_MENU'
-  1) 启动临时 iperf3 服务端
+  1) 自动安装并启动临时 iperf3 服务端（随机空闲端口）
   2) 查看状态和本地客户端命令
   3) 停止临时 iperf3 服务端
   0) 返回
@@ -1559,30 +2037,75 @@ EOF_IPERF_MENU
   if [[ "$(uname -s)" == "Linux" ]] && have ip; then
     default_address="$(guess_server_address 2>/dev/null || true)"
   fi
-  prompt_text "服务器公网 IP/域名（用于生成客户端命令）" "$default_address" || return 0
-  address="$REPLY_VALUE"
-  [[ -n "$address" ]] || address="<服务器公网IP或域名>"
-  prompt_integer "iperf3 TCP 端口" "5201" "1" "65535" || return 0
-  port="$REPLY_VALUE"
+  if [[ "$choice" != "3" ]]; then
+    prompt_text "服务器公网 IP/域名（用于生成客户端命令）" "$default_address" || return 0
+    address="$REPLY_VALUE"
+    [[ -n "$address" ]] || address="<服务器公网IP或域名>"
+  fi
 
   case "$choice" in
     1)
-      if ! have iperf3; then
-        ui_error "远程服务器未安装 iperf3。请先安装："
-        printf '  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y iperf3\n'
-        printf '  RHEL/Rocky/Alma: sudo dnf install -y iperf3\n'
-        return 0
-      fi
-      ui_warning "请同时在云安全组和服务器防火墙放行 TCP ${port}。"
-      interactive_run_script 1 iperf-start --iperf-port "$port" --server-address "$address" || true
+      ui_note "若未安装 iperf3，脚本将使用服务器包管理器自动安装。"
+      ui_note "服务启动时会在 20000~59999 中随机选择一个未占用端口。"
+      interactive_run_script 1 iperf-start --iperf-port 0 --server-address "$address" || true
       ;;
     2)
-      interactive_run_script 0 iperf-status --iperf-port "$port" --server-address "$address" || true
+      interactive_run_script 0 iperf-status --server-address "$address" || true
       ;;
     3)
-      interactive_run_script 1 iperf-stop --iperf-port "$port" || true
+      interactive_run_script 1 iperf-stop || true
       ;;
   esac
+}
+
+interactive_autotune_wizard() {
+  local address="" default_address="" streams duration target_util max_retrans max_rounds wait_seconds rollback_seconds
+  local extra_args=()
+  ui_header "服务器 BBR 自动闭环调优"
+  ui_note "脚本只修改远程服务器；本地电脑只需按提示运行 iperf3 命令。"
+  ui_note "每轮结果由服务器端 iperf3 JSON 自动读取，不需要手工抄写测速值。"
+  interactive_collect_tuning || return 0
+
+  if [[ "$(uname -s)" == "Linux" ]] && have ip; then
+    default_address="$(guess_server_address 2>/dev/null || true)"
+  fi
+  prompt_text "服务器公网 IP/域名" "$default_address" || return 0
+  address="$REPLY_VALUE"
+  [[ -n "$address" ]] || { ui_error "服务器公网 IP/域名不能为空"; return 0; }
+  prompt_integer "每轮测试并发流数量" "1" "1" "64" || return 0
+  streams="$REPLY_VALUE"
+  prompt_integer "每轮测试时长（秒）" "15" "3" "300" || return 0
+  duration="$REPLY_VALUE"
+  prompt_number "达标吞吐占目标带宽百分比" "90" "1" "100" || return 0
+  target_util="$REPLY_VALUE"
+  prompt_number "允许的最大估算重传比例（%）" "1" "0" "100" || return 0
+  max_retrans="$REPLY_VALUE"
+  prompt_integer "最大自动调参轮数" "4" "1" "10" || return 0
+  max_rounds="$REPLY_VALUE"
+  prompt_integer "每轮等待本地测试的最长时间（秒）" "300" "30" "3600" || return 0
+  wait_seconds="$REPLY_VALUE"
+  prompt_integer "SSH 安全自动回滚总等待时间（秒）" "3600" "300" "86400" || return 0
+  rollback_seconds="$REPLY_VALUE"
+  if prompt_yes_no "达标后持久化最终服务器参数" "n"; then
+    extra_args+=(--persist-on-success)
+  fi
+
+  ui_warning "随机端口需要云安全组/服务器防火墙放行 20000~59999，或按显示的端口临时放行。"
+  if ! prompt_yes_no "确认开始自动闭环调优" "n"; then
+    ui_note "已取消。"
+    return 0
+  fi
+
+  interactive_run_script 1 autotune "${WIZARD_ARGS[@]}" \
+    --server-address "$address" \
+    --parallel "$streams" \
+    --duration "$duration" \
+    --target-utilization "$target_util" \
+    --max-retrans-percent "$max_retrans" \
+    --max-iterations "$max_rounds" \
+    --test-wait-seconds "$wait_seconds" \
+    --auto-rollback-seconds "$rollback_seconds" \
+    "${extra_args[@]}" || true
 }
 
 interactive_confirm_wizard() {
@@ -1634,7 +2157,7 @@ interactive_rollback_wizard() {
 }
 
 interactive_main() {
-  [[ -t 0 && -t 1 ]] || die "交互模式需要终端；自动化环境请使用 probe/plan/apply/verify/rollback 子命令"
+  [[ -t 0 && -t 1 ]] || die "交互模式需要终端；自动化环境请使用 probe/plan/apply/autotune/verify/rollback 子命令"
   require_linux
   ui_init
 
@@ -1646,29 +2169,31 @@ interactive_main() {
     fi
     printf '\n'
     cat <<'EOF_MENU'
-  1) 检测远程服务器环境
-  2) 管理服务器端 iperf3 测速服务
-  3) 根据客户端实测数据生成方案（不修改服务器）
-  4) 临时应用方案（带 SSH 自动回滚）
-  5) 持久化应用方案（带 SSH 自动回滚）
-  6) 确认配置并取消自动回滚
-  7) 验证服务器当前配置
-  8) 立即回滚配置
-  9) 查看命令行帮助
+  1) 检测服务器并自动安装 iperf3
+  2) 管理服务器端 iperf3 测速服务（随机端口）
+  3) 自动闭环测试并调优服务器 BBR（推荐）
+  4) 根据客户端数据生成方案（不修改服务器）
+  5) 手动临时应用方案
+  6) 手动持久化应用方案
+  7) 确认配置并取消自动回滚
+  8) 验证服务器当前配置
+  9) 立即回滚配置
+  10) 查看命令行帮助
   0) 退出
 EOF_MENU
-    prompt_choice "请选择操作" "1" "0 1 2 3 4 5 6 7 8 9" || { printf '\n'; return 0; }
+    prompt_choice "请选择操作" "1" "0 1 2 3 4 5 6 7 8 9 10" || { printf '\n'; return 0; }
     case "$REPLY_VALUE" in
       0) printf '\n再见。\n'; return 0 ;;
       1) interactive_probe_wizard; interactive_pause ;;
       2) interactive_iperf_wizard; interactive_pause ;;
-      3) interactive_tuning_wizard plan; interactive_pause ;;
-      4) interactive_tuning_wizard runtime; interactive_pause ;;
-      5) interactive_tuning_wizard persistent; interactive_pause ;;
-      6) interactive_confirm_wizard; interactive_pause ;;
-      7) interactive_verify_wizard; interactive_pause ;;
-      8) interactive_rollback_wizard; interactive_pause ;;
-      9) usage; interactive_pause ;;
+      3) interactive_autotune_wizard; interactive_pause ;;
+      4) interactive_tuning_wizard plan; interactive_pause ;;
+      5) interactive_tuning_wizard runtime; interactive_pause ;;
+      6) interactive_tuning_wizard persistent; interactive_pause ;;
+      7) interactive_confirm_wizard; interactive_pause ;;
+      8) interactive_verify_wizard; interactive_pause ;;
+      9) interactive_rollback_wizard; interactive_pause ;;
+      10) usage; interactive_pause ;;
     esac
   done
 }
@@ -1681,6 +2206,7 @@ main() {
     probe) probe ;;
     plan) print_plan ;;
     apply) apply_tuning ;;
+    autotune) autotune_session ;;
     iperf-start) iperf_server_start ;;
     iperf-status) iperf_server_status ;;
     iperf-stop) iperf_server_stop ;;
@@ -1688,7 +2214,7 @@ main() {
     verify) verify_tuning ;;
     rollback) rollback ;;
     help) usage ;;
-    *) die "未知命令：${COMMAND}（可用：interactive/probe/plan/apply/iperf-start/iperf-status/iperf-stop/confirm/verify/rollback）" ;;
+    *) die "未知命令：${COMMAND}（可用：interactive/probe/plan/apply/autotune/iperf-start/iperf-status/iperf-stop/confirm/verify/rollback）" ;;
   esac
 }
 
