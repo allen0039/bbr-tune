@@ -76,16 +76,48 @@ if ! adjust_autotune_candidate; then fail "hard-cap retrans adjustment"; fi
 assert_eq "$HEADROOM_PERCENT" "92" "hard-cap headroom reduction"
 if adjust_autotune_candidate; then fail "headroom must not fall below throughput-safe floor"; fi
 
-TEST_RESULT_MBPS="850"
-TEST_RESULT_RETRANS_PERCENT="0.2"
+TEST_RESULT_MBPS="187.23"
+TEST_RESULT_RETRANS_PERCENT="0.0073"
 BUFFER_FACTOR="1.35"
 RTT_MS="180"
+PROFILE="auto"
+SYMPTOM="normal"
+RESOLVED_PROFILE="lfn"
+PARALLEL_STREAMS="1"
+AUTOTUNE_MULTIFLOW="0"
 calculate_plan
-if ! adjust_autotune_candidate; then fail "buffer factor adjustment"; fi
+if ! adjust_autotune_candidate; then fail "single-flow QoS fallback to 8 streams"; fi
+assert_eq "$PARALLEL_STREAMS" "8" "parallel stream progression 1 to 8"
+assert_eq "$RESOLVED_PROFILE" "qos" "QoS profile classification"
+if ! adjust_autotune_candidate; then fail "8-flow QoS fallback to 16 streams"; fi
+assert_eq "$PARALLEL_STREAMS" "16" "parallel stream progression 8 to 16"
+
+# Once 16 streams still miss the target, increase the buffer only when it changes
+# the effective limit.
+if ! adjust_autotune_candidate; then fail "buffer factor adjustment after 16-flow test"; fi
 assert_eq "$BUFFER_FACTOR" "2.0" "buffer factor progression"
+assert_eq "$(next_parallel_stream_count 1)" "8" "stream count 1 to 8"
+assert_eq "$(next_parallel_stream_count 8)" "16" "stream count 8 to 16"
+assert_eq "$(next_parallel_stream_count 16)" "16" "stream count ceiling"
 assert_eq "$(next_buffer_factor 2.0)" "3.0" "buffer factor 2 to 3"
 assert_eq "$(next_buffer_factor 3.0)" "4.0" "buffer factor 3 to 4"
 assert_eq "$(next_buffer_factor 4.0)" "4.0" "buffer factor ceiling"
+
+# Reproduce the reported case: a large existing buffer is not treated as a dead
+# end until the script has tried 8 and 16 streams.
+PROFILE="auto"
+SYMPTOM="normal"
+RESOLVED_PROFILE="lfn"
+PARALLEL_STREAMS="1"
+AUTOTUNE_MULTIFLOW="0"
+BUFFER_FACTOR="1.35"
+BUFFER_MAX_MIB="128"
+BUFFER_BYTES="$((128 * 1048576))"
+if ! adjust_autotune_candidate; then fail "reported case must continue to 8 streams"; fi
+assert_eq "$PARALLEL_STREAMS" "8" "reported case 8 streams"
+if ! adjust_autotune_candidate; then fail "reported case must continue to 16 streams"; fi
+assert_eq "$PARALLEL_STREAMS" "16" "reported case 16 streams"
+if adjust_autotune_candidate; then fail "no effective adjustment after 16 streams and max buffer"; fi
 
 # Listener detection works with IPv4, IPv6 and wildcard addresses from ss.
 (

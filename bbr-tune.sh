@@ -3,7 +3,7 @@
 # 目标：可审计、可预览、可回滚；不把 socket buffer 误当作限速器。
 set -Eeuo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -67,6 +67,7 @@ TEST_RESULT_BYTES=""
 TEST_RESULT_RETRANS=""
 TEST_RESULT_RETRANS_PERCENT=""
 CURRENT_TEST_PID=""
+AUTOTUNE_MULTIFLOW="0"
 
 log()  { (( QUIET )) || printf '%s\n' "$*"; }
 info() { log "[INFO] $*"; }
@@ -124,7 +125,7 @@ usage() {
   --max-retrans-percent N 允许的估算重传比例，默认 1%
   --max-iterations N      最大自动调参轮数，默认 4
   --test-wait-seconds N   每轮等待本地客户端连接的秒数，默认 300
-  --parallel N            达标测试使用的并发流数，默认 1
+  --parallel N            初始并发流数，默认 1；低重传低吞吐时自动尝试 8/16 流
   --duration N            每轮测试时长，默认 15 秒
   --persist-on-success    达标后把最终服务器参数持久化
 
@@ -142,7 +143,7 @@ usage() {
   ./bbr-tune.sh probe --target 1.1.1.1 --server-address speed.example.com
   sudo ./bbr-tune.sh iperf-start --iperf-port 0 --server-address speed.example.com
   ./bbr-tune.sh plan --profile hard-cap --cap-mbps 200 --bandwidth-mbps 200 --rtt-ms 30
-  sudo ./bbr-tune.sh autotune --profile auto --bandwidth-mbps 1000 --rtt-ms 180 --parallel 8 --server-address speed.example.com
+  sudo ./bbr-tune.sh autotune --profile auto --bandwidth-mbps 1000 --rtt-ms 180 --parallel 1 --server-address speed.example.com
   sudo ./bbr-tune.sh confirm
   ./bbr-tune.sh verify
   sudo ./bbr-tune.sh rollback --yes
@@ -1229,6 +1230,31 @@ test_result_meets_target() {
   ! test_result_speed_low && ! test_result_retrans_high
 }
 
+next_parallel_stream_count() {
+  local current="$1"
+  if (( current < 8 )); then
+    printf '8\n'
+  elif (( current < 16 )); then
+    printf '16\n'
+  else
+    printf '%s\n' "$current"
+  fi
+}
+
+increase_test_parallelism() {
+  local next
+  next="$(next_parallel_stream_count "$PARALLEL_STREAMS")"
+  [[ "$next" != "$PARALLEL_STREAMS" ]] || return 1
+  PARALLEL_STREAMS="$next"
+  AUTOTUNE_MULTIFLOW="1"
+  if [[ "$RESOLVED_PROFILE" != "hard-cap" ]]; then
+    PROFILE="qos"
+    SYMPTOM="single-flow-qos"
+    RESOLVED_PROFILE="qos"
+  fi
+  return 0
+}
+
 next_buffer_factor() {
   awk -v f="$1" 'BEGIN {
     if (f < 1.5) print "2.0";
@@ -1314,13 +1340,18 @@ adjust_autotune_candidate() {
   fi
 
   if test_result_speed_low; then
+    if increase_test_parallelism; then
+      info "重传很低但单流/少量流吞吐不足：下一轮改用 ${PARALLEL_STREAMS} 个并发流判断是否存在运营商单流 QoS"
+      return 0
+    fi
+
     previous_factor="$BUFFER_FACTOR"
     if increase_effective_buffer_factor; then
       new_factor="$BUFFER_FACTOR"
-      info "重传已受控但吞吐未达标：下一轮把服务器 BDP 缓冲系数从 ${previous_factor} 提高至 ${new_factor}（buffer=${BUFFER_BYTES}）"
+      info "16 流总吞吐仍未达标：下一轮把服务器 BDP 缓冲系数从 ${previous_factor} 提高至 ${new_factor}（buffer=${BUFFER_BYTES}）"
       return 0
     fi
-    warn "吞吐仍未达标，但继续提高 BDP 系数不会增大当前有效缓冲上限"
+    warn "16 流总吞吐仍未达标，且继续提高 BDP 系数不会增大当前有效缓冲上限"
   fi
 
   return 1
@@ -1355,7 +1386,7 @@ autotune_session() {
   session_dir="${STATE_DIR}/autotune/$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$session_dir"
   report_file="${session_dir}/results.tsv"
-  printf 'round\tprofile\tbuffer_factor\theadroom\tbuffer_bytes\tmbps\tretrans\tretrans_percent\tpassed\n' >"$report_file"
+  printf 'round\tprofile\tstreams\tbuffer_factor\theadroom\tbuffer_bytes\tmbps\tretrans\tretrans_percent\tpassed\n' >"$report_file"
   min_mbps="$(awk -v bw="$BANDWIDTH_MBPS" -v p="$TARGET_UTILIZATION" 'BEGIN {printf "%.2f", bw*p/100}')"
 
   cat <<EOF_SESSION
@@ -1365,7 +1396,7 @@ autotune_session() {
 目标带宽：${BANDWIDTH_MBPS} Mbps
 达标吞吐：>= ${min_mbps} Mbps（${TARGET_UTILIZATION}%）
 最大估算重传比例：${MAX_RETRANS_PERCENT}%
-测试并发流：${PARALLEL_STREAMS}
+初始测试并发流：${PARALLEL_STREAMS}
 最大调参轮数：${MAX_ITERATIONS}
 结果目录：${session_dir}
 
@@ -1376,8 +1407,8 @@ EOF_SESSION
   info "先执行基线测试；基线达标时不会修改任何服务器参数"
   trap abort_current_test_signal INT TERM
   run_reverse_test "$session_dir" baseline "$address" "$port" "$PARALLEL_STREAMS" "$DURATION" "$TEST_WAIT_SECONDS"
-  printf '0\tbaseline\t-\t-\t-\t%s\t%s\t%s\t%s\n' \
-    "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT" \
+  printf '0\tbaseline\t%s\t-\t-\t-\t%s\t%s\t%s\t%s\n' \
+    "$PARALLEL_STREAMS" "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT" \
     "$(test_result_meets_target && echo yes || echo no)" >>"$report_file"
 
   if test_result_meets_target; then
@@ -1411,7 +1442,7 @@ EOF_SESSION
   for ((round=1; round<=MAX_ITERATIONS; round++)); do
     calculate_plan
     adjust_for_existing_buffers
-    candidate_note="profile=${RESOLVED_PROFILE}, factor=${BUFFER_FACTOR}, buffer=${BUFFER_BYTES}, headroom=${HEADROOM_PERCENT}%"
+    candidate_note="profile=${RESOLVED_PROFILE}, streams=${PARALLEL_STREAMS}, factor=${BUFFER_FACTOR}, buffer=${BUFFER_BYTES}, headroom=${HEADROOM_PERCENT}%"
     info "第 ${round}/${MAX_ITERATIONS} 轮应用服务器参数：${candidate_note}"
     apply_sysctls_runtime
     apply_qdisc_runtime "$iface"
@@ -1419,13 +1450,13 @@ EOF_SESSION
     run_reverse_test "$session_dir" "round-${round}" "$address" "$port" "$PARALLEL_STREAMS" "$DURATION" "$TEST_WAIT_SECONDS"
     if test_result_meets_target; then
       success=1
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tyes\n' \
-        "$round" "$RESOLVED_PROFILE" "$BUFFER_FACTOR" "$HEADROOM_PERCENT" "$BUFFER_BYTES" \
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tyes\n' \
+        "$round" "$RESOLVED_PROFILE" "$PARALLEL_STREAMS" "$BUFFER_FACTOR" "$HEADROOM_PERCENT" "$BUFFER_BYTES" \
         "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT" >>"$report_file"
       break
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tno\n' \
-      "$round" "$RESOLVED_PROFILE" "$BUFFER_FACTOR" "$HEADROOM_PERCENT" "$BUFFER_BYTES" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tno\n' \
+      "$round" "$RESOLVED_PROFILE" "$PARALLEL_STREAMS" "$BUFFER_FACTOR" "$HEADROOM_PERCENT" "$BUFFER_BYTES" \
       "$TEST_RESULT_MBPS" "$TEST_RESULT_RETRANS" "$TEST_RESULT_RETRANS_PERCENT" >>"$report_file"
 
     if ! adjust_autotune_candidate; then
@@ -1437,6 +1468,10 @@ EOF_SESSION
   if (( success == 0 )); then
     trap - ERR INT TERM
     warn "在最大轮数内未同时满足吞吐和重传条件，正在恢复服务器基线"
+    warn "最后结果：${TEST_RESULT_MBPS} Mbps（要求 >= ${min_mbps} Mbps），估算重传 ${TEST_RESULT_RETRANS_PERCENT}%（要求 <= ${MAX_RETRANS_PERCENT}%），并发流 ${PARALLEL_STREAMS}"
+    if (( PARALLEL_STREAMS >= 16 )) && ! test_result_retrans_high; then
+      warn "16 流重传仍很低但总吞吐不足：请核对目标带宽；瓶颈很可能位于物理端口、云厂商/运营商限速或接收端，而不是服务器 TCP buffer"
+    fi
     cancel_pending_for_backup "$backup"
     restore_backup_internal "$backup"
     info "测试报告：$report_file"
@@ -1448,8 +1483,11 @@ EOF_SESSION
     persist_current_tuning "$iface"
   fi
   trap - ERR INT TERM
-  info "自动调优达标：${TEST_RESULT_MBPS} Mbps，估算重传 ${TEST_RESULT_RETRANS_PERCENT}%"
+  info "自动调优达标：${TEST_RESULT_MBPS} Mbps，估算重传 ${TEST_RESULT_RETRANS_PERCENT}%，并发流 ${PARALLEL_STREAMS}"
   info "最终参数：profile=${RESOLVED_PROFILE}, factor=${BUFFER_FACTOR}, buffer=${BUFFER_BYTES}, headroom=${HEADROOM_PERCENT}%"
+  if (( AUTOTUNE_MULTIFLOW )); then
+    warn "本次达标依赖 ${PARALLEL_STREAMS} 个并发流；这通常表示单流受到沿途 QoS/策略限制，服务器 BBR 参数无法消除外部单流上限"
+  fi
   info "测试报告：$report_file"
   warn "请另开 SSH 会话验证服务器；确认正常后执行：sudo $PROGRAM confirm"
 }
@@ -1833,6 +1871,10 @@ interactive_run_script() {
       rc=$?
     fi
   fi
+  if [[ "${1:-}" == "autotune" && "$rc" == "2" ]]; then
+    ui_warning "自动调优未达到设定目标，服务器基线已恢复；这通常表示瓶颈位于运营商 QoS、物理链路或外部限速器"
+    return 0
+  fi
   ui_error "命令执行失败，退出码：$rc"
   return "$rc"
 }
@@ -2072,7 +2114,7 @@ interactive_autotune_wizard() {
   prompt_text "服务器公网 IP/域名" "$default_address" || return 0
   address="$REPLY_VALUE"
   [[ -n "$address" ]] || { ui_error "服务器公网 IP/域名不能为空"; return 0; }
-  prompt_integer "每轮测试并发流数量" "1" "1" "64" || return 0
+  prompt_integer "起始测试并发流数量（不足时自动尝试 8/16 流）" "1" "1" "64" || return 0
   streams="$REPLY_VALUE"
   prompt_integer "每轮测试时长（秒）" "15" "3" "300" || return 0
   duration="$REPLY_VALUE"
