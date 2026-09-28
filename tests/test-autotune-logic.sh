@@ -63,11 +63,44 @@ RESULT_MBPS="850"
 RESULT_RETRANS_PERCENT="0.2"
 calculate_result_quality
 assert_eq "$RESULT_PASS" "no" "low-throughput result"
-result_better_than "$pass_score" "$RESULT_SCORE" || fail "passing result score"
-result_low_speed_low_retrans || fail "single-flow QoS detection"
-assert_eq "$(next_stream_count 1)" "8" "stream progression 1 to 8"
-assert_eq "$(next_stream_count 8)" "16" "stream progression 8 to 16"
-assert_eq "$(next_stream_count 16)" "16" "stream ceiling"
+awk -v passing="$pass_score" -v failing="$RESULT_SCORE" 'BEGIN {exit !(passing>failing)}' || fail "passing result score"
+
+# Balanced evaluation protects both single-connection and multi-connection
+# throughput relative to their independent baselines.
+BASELINE_SINGLE_MBPS="200"
+BASELINE_MULTI_MBPS="900"
+BALANCE_MIN_RETENTION_PERCENT="95"
+PAIR_SINGLE_RETRANS_PERCENT="0.1"
+PAIR_MULTI_RETRANS_PERCENT="0.1"
+PAIR_SINGLE_MBPS="189"
+PAIR_MULTI_MBPS="1000"
+calculate_pair_quality yes
+assert_eq "$PAIR_ELIGIBLE" "no" "single-connection baseline protection"
+PAIR_SINGLE_MBPS="220"
+PAIR_MULTI_MBPS="854"
+calculate_pair_quality yes
+assert_eq "$PAIR_ELIGIBLE" "no" "multi-connection baseline protection"
+PAIR_SINGLE_MBPS="220"
+PAIR_MULTI_MBPS="900"
+calculate_pair_quality yes
+assert_eq "$PAIR_ELIGIBLE" "yes" "balanced candidate eligibility"
+
+PAIR_SINGLE_MBPS="600"; PAIR_MULTI_MBPS="600"
+calculate_pair_quality no
+balanced_score="$PAIR_SCORE"
+PAIR_SINGLE_MBPS="1000"; PAIR_MULTI_MBPS="200"
+calculate_pair_quality no
+biased_score="$PAIR_SCORE"
+awk -v balanced="$balanced_score" -v biased="$biased_score" 'BEGIN {exit !(balanced>biased)}' || fail "harmonic score must penalize one-sided performance"
+PAIR_ELIGIBLE="yes"
+pair_better_than 61 60 || fail "balanced score improvement"
+if pair_better_than 60.1 60; then fail "minor score noise must not replace the best candidate"; fi
+PAIR_ELIGIBLE="no"
+if pair_better_than 70 60; then fail "ineligible candidate must not become best"; fi
+pair_regressed 70 60 || fail "ineligible candidate is outside the safe boundary"
+PAIR_ELIGIBLE="yes"
+pair_regressed 59 60 || fail "material balanced-score regression"
+if pair_regressed 59.5 60; then fail "minor balanced-score noise must not trigger rollback"; fi
 
 # Listener detection works with IPv4, IPv6 and wildcard addresses.
 (
@@ -97,23 +130,29 @@ port="$(choose_random_port)"
 (( port >= 20000 && port <= 59999 )) || fail "random port range"
 assert_eq "$(cat "${tmp}/checks")" "3" "occupied ports skipped"
 
-if grep -qi 'prompt' "${ROOT}/bbr-tune.sh"; then fail "script must not expose prompt wording"; fi
-# Simulate a complete multi-round search: 1/8/16-flow baseline, three memory
-# candidates, and a final confirmation of the best candidate.
+forbidden='pro''mpt'
+if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohibited development wording"; fi
+
+# Simulate a complete balanced search: baseline pair, three growth candidates,
+# six backtracking candidates, and one final verification pair.
 (
   sim="$(mktemp -d)"
   trap 'rm -rf "$sim"' EXIT
   STATE_DIR="$sim/state"; SESSION_ROOT="${STATE_DIR}/sessions"; BACKUP_ROOT="${STATE_DIR}/backups"
   LATEST_BACKUP="${STATE_DIR}/latest"; PENDING_DIR="${STATE_DIR}/pending"; PENDING_LATEST="${STATE_DIR}/pending-latest"
   HISTORY_FILE="${STATE_DIR}/history.tsv"
-  TARGET_MBPS="1000"; START_STREAMS="1"; TEST_STREAMS="1"
+  TARGET_MBPS="1000"; START_STREAMS="8"; TEST_STREAMS="1"
   TARGET_UTILIZATION="90"; MAX_RETRANS_PERCENT="1"; AUTO_ROLLBACK_SECONDS="0"
   SERVER_ADDRESS="speed.example.com"; IFACE="auto"; PERSIST_FINAL="0"; FORCE="0"
   require_linux() { :; }; require_root() { :; }; have() { return 0; }; pending_guard() { :; }
   install_iperf3_if_needed() { :; }; ensure_bbr() { :; }; schedule_rollback() { :; }
   resolve_iface() { echo eth0; }; guess_server_address() { echo speed.example.com; }; choose_random_port() { echo 34567; }
   ip() { return 0; }; root_qdisc_kind() { echo fq_codel; }; apply_candidate() { :; }
-  detect_memory_limits() { MEM_TOTAL_MIB=8192; MEM_AVAILABLE_MIB=4096; MEM_EFFECTIVE_MIB=8192; MEM_BUFFER_CAP_MIB=128; }
+  detect_memory_limits() {
+    MEM_TOTAL_MIB=8192; MEM_AVAILABLE_MIB=4096; MEM_EFFECTIVE_MIB=8192
+    MEM_TCP_BUDGET_MIB=5461; MEM_BUFFER_CAP_MIB=128; PAGE_SIZE_BYTES=4096
+    TCP_MEM_LOW_PAGES=699050; TCP_MEM_PRESSURE_PAGES=1048576; TCP_MEM_HIGH_PAGES=1398101
+  }
   current_buffer_max() { echo 16777216; }
   sysctl_get() {
     case "$1" in
@@ -123,6 +162,7 @@ if grep -qi 'prompt' "${ROOT}/bbr-tune.sh"; then fail "script must not expose pr
       net.core.rmem_max|net.core.wmem_max) echo 16777216 ;;
       net.ipv4.tcp_rmem) echo '4096 131072 16777216' ;;
       net.ipv4.tcp_wmem) echo '4096 16384 16777216' ;;
+      net.ipv4.tcp_mem) echo '699050 1048576 1398101' ;;
       *) echo 1 ;;
     esac
   }
@@ -130,46 +170,36 @@ if grep -qi 'prompt' "${ROOT}/bbr-tune.sh"; then fail "script must not expose pr
     SESSION_ID="simulated"; SESSION_DIR="${SESSION_ROOT}/${SESSION_ID}"; mkdir -p "$SESSION_DIR"
     RUN_LOG="${SESSION_DIR}/run.log"; REPORT_FILE="${SESSION_DIR}/results.tsv"; COMPARISON_FILE="${SESSION_DIR}/comparison.txt"
     : >"$RUN_LOG"
-    printf 'stage\tround\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tscore\tpassed\n' >"$REPORT_FILE"
+    printf 'stage\tround\tmode\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tmetric_score\tpassed\tbalance_score\teligible\n' >"$REPORT_FILE"
   }
   capture_state() { printf 'state\n' >"$2"; }
   create_backup() { local d="${BACKUP_ROOT}/${SESSION_ID}"; mkdir -p "$d"; echo "$d"; }
   cancel_rollback_for_backup() { :; }; restore_backup() { :; }
   call=0
+  test_mbps=(200 900 250 920 300 950 250 960 270 955 310 960 290 965 305 962 312 963 280 964 315 958)
   run_reverse_test() {
     call=$((call+1))
     RESULT_RTT_MS=180; RESULT_RTT_SOURCE="simulated TCP RTT"
-    case "$call" in
-      1) RESULT_MBPS=187.23; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.0073 ;;
-      2) RESULT_MBPS=700; RESULT_RETRANS=20; RESULT_RETRANS_PERCENT=0.005 ;;
-      3) RESULT_MBPS=920; RESULT_RETRANS=25; RESULT_RETRANS_PERCENT=0.004 ;;
-      4) RESULT_MBPS=930; RESULT_RETRANS=20; RESULT_RETRANS_PERCENT=0.003 ;;
-      5) RESULT_MBPS=950; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
-      6) RESULT_MBPS=940; RESULT_RETRANS=17; RESULT_RETRANS_PERCENT=0.002 ;;
-      7) RESULT_MBPS=930; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
-      8) RESULT_MBPS=940; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
-      9) RESULT_MBPS=960; RESULT_RETRANS=16; RESULT_RETRANS_PERCENT=0.002 ;;
-      10) RESULT_MBPS=940; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
-      11) RESULT_MBPS=950; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
-      12) RESULT_MBPS=958; RESULT_RETRANS=17; RESULT_RETRANS_PERCENT=0.002 ;;
-      13) RESULT_MBPS=959; RESULT_RETRANS=17; RESULT_RETRANS_PERCENT=0.002 ;;
-      *) fail "unexpected simulated test call $call" ;;
-    esac
-    RESULT_BYTES=1000000000
+    RESULT_MBPS="${test_mbps[$((call-1))]:-}"
+    [[ -n "$RESULT_MBPS" ]] || fail "unexpected simulated test call $call"
+    RESULT_RETRANS=10; RESULT_RETRANS_PERCENT=0.002; RESULT_BYTES=1000000000
     calculate_result_quality
   }
   autotune
-  assert_eq "$call" "13" "growth, overshoot, backtrack and confirmation count"
-  assert_eq "$BEST_KIND" "candidate-6" "best candidate selection"
-  assert_eq "$BEST_BUFFER_MIB" "72" "best buffer selection"
-  assert_eq "$FINAL_MBPS" "959" "final confirmation throughput"
+  assert_eq "$call" "22" "balanced growth, backtrack and verification test count"
+  assert_eq "$BEST_KIND" "candidate-8" "best balanced candidate selection"
+  assert_eq "$BEST_BUFFER_MIB" "86" "best balanced buffer selection"
+  assert_eq "$FINAL_SINGLE_MBPS" "315" "final single-connection verification"
+  assert_eq "$FINAL_MULTI_MBPS" "958" "final multi-connection verification"
   assert_eq "$OUTCOME" "optimized-runtime" "search outcome"
-  assert_eq "$QOS_DETECTED" "1" "single-flow QoS classification"
+  assert_eq "$QOS_DETECTED" "1" "single-versus-multi difference classification"
   assert_eq "$OVERSHOOT_DETECTED" "1" "overshoot detection"
-  assert_eq "$SEARCH_ROUNDS" "9" "unlimited adaptive search rounds"
+  assert_eq "$SEARCH_ROUNDS" "9" "adaptive search rounds"
   [[ -s "$REPORT_FILE" ]] || fail "simulated results log"
   [[ -s "$COMPARISON_FILE" ]] || fail "simulated comparison log"
   [[ -s "$HISTORY_FILE" ]] || fail "simulated history log"
+  grep -q $'single\tbbr-fq\t1\t86' "$REPORT_FILE" || fail "single-connection candidate log"
+  grep -q $'multi\tbbr-fq\t8\t86' "$REPORT_FILE" || fail "multi-connection candidate log"
 )
 
 printf 'All autotune logic tests passed.\n'

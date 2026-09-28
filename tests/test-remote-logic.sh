@@ -42,26 +42,56 @@ schedule_rollback "$backup"
 cancel_rollback_for_backup "$backup"
 [[ ! -e "$(pending_path "$backup")" ]] || fail "rollback cancellation"
 
-# Detailed before/after comparison is retained for later time-period analysis.
+# The retained comparison is a technical report that includes both traffic
+# patterns, the memory budget, kernel parameters, and convergence evidence.
 SESSION_ID="test-session"
 SESSION_DIR="$tmp/session"
 mkdir -p "$SESSION_DIR"
 RUN_LOG="${SESSION_DIR}/run.log"
 REPORT_FILE="${SESSION_DIR}/results.tsv"
 COMPARISON_FILE="${SESSION_DIR}/comparison.txt"
-printf 'stage\tround\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tscore\tpassed\nfinal\t4\tbbr-fq\t8\t64\t2.98\t180\t920\t10\t0.005\t1102\tyes\n' >"$REPORT_FILE"
+printf 'stage\tround\tmode\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tmetric_score\tpassed\tbalance_score\teligible\n' >"$REPORT_FILE"
+printf 'before\t0\tsingle\toriginal\t1\t6\toriginal\t180\t200\t20\t0.0100\t20\tno\t32.7273\tyes\n' >>"$REPORT_FILE"
+printf 'before\t0\tmulti\toriginal\t8\t6\toriginal\t180\t900\t30\t0.0060\t90\tyes\t32.7273\tyes\n' >>"$REPORT_FILE"
+printf 'final\t4\tsingle\tbbr-fq\t1\t64\t2.98\t180\t260\t10\t0.0050\t26\tno\t41.6000\tyes\n' >>"$REPORT_FILE"
+printf 'final\t4\tmulti\tbbr-fq\t8\t64\t2.98\t180\t1040\t10\t0.0030\t104\tyes\t41.6000\tyes\n' >>"$REPORT_FILE"
+: >"$RUN_LOG"
 SERVER_ADDRESS="speed.example.com"
-TARGET_MBPS="1000"; TARGET_UTILIZATION="90"; RTT_MS="180"; BASELINE_STREAMS="8"
-MEM_TOTAL_MIB="8192"; MEM_AVAILABLE_MIB="4096"; MEM_EFFECTIVE_MIB="8192"; MEM_BUFFER_CAP_MIB="64"; BDP_MIB="21.46"; RTT_SOURCE="simulated TCP RTT"
-BEFORE_CC="cubic"; BEFORE_QDISC="fq_codel"; BEFORE_RMEM="4096 131072 6291456"; BEFORE_WMEM="4096 16384 4194304"; BEFORE_BUFFER_BYTES="6291456"
-BASELINE_MBPS="600"; BASELINE_RETRANS="20"; BASELINE_RETRANS_PERCENT="0.01"; BASELINE_PASS="no"
-FINAL_MBPS="920"; FINAL_RETRANS="10"; FINAL_RETRANS_PERCENT="0.005"; FINAL_PASS="yes"
-OUTCOME="optimized-runtime"; BEST_KIND="candidate-2"; BEST_BUFFER_MIB="64"; BEST_FACTOR="2.98"; QOS_DETECTED="1"; SEARCH_ROUNDS="4"; OVERSHOOT_DETECTED="1"; OVERSHOOT_MIB="128"
-sysctl_get() { case "$1" in net.ipv4.tcp_congestion_control) echo bbr ;; net.ipv4.tcp_rmem) echo '4096 131072 67108864' ;; net.ipv4.tcp_wmem) echo '4096 16384 67108864' ;; esac; }
+TARGET_MBPS="1000"; TARGET_UTILIZATION="90"; MAX_RETRANS_PERCENT="1"; RTT_MS="180"; RTT_SOURCE="simulated TCP RTT"
+BALANCE_MULTI_STREAMS="8"; BALANCE_MIN_RETENTION_PERCENT="95"
+MEM_TOTAL_MIB="8192"; MEM_AVAILABLE_MIB="4096"; MEM_EFFECTIVE_MIB="8192"
+MEM_TCP_BUDGET_MIB="5461"; MEM_BUFFER_CAP_MIB="2047"; BDP_MIB="21.46"
+TCP_MEM_LOW_PAGES="699050"; TCP_MEM_PRESSURE_PAGES="1048576"; TCP_MEM_HIGH_PAGES="1398101"
+BEFORE_CC="cubic"; BEFORE_QDISC="fq_codel"; BEFORE_RMEM="4096 131072 6291456"; BEFORE_WMEM="4096 16384 4194304"
+BEFORE_TCP_MEM="196608 262144 393216"; BEFORE_BUFFER_BYTES="6291456"
+BASELINE_SINGLE_MBPS="200"; BASELINE_SINGLE_RETRANS="20"; BASELINE_SINGLE_RETRANS_PERCENT="0.0100"; BASELINE_SINGLE_PASS="no"
+BASELINE_MULTI_MBPS="900"; BASELINE_MULTI_RETRANS="30"; BASELINE_MULTI_RETRANS_PERCENT="0.0060"; BASELINE_MULTI_PASS="yes"
+BASELINE_SCORE="32.7273"; BASELINE_PASS="no"
+FINAL_SINGLE_MBPS="260"; FINAL_SINGLE_RETRANS="10"; FINAL_SINGLE_RETRANS_PERCENT="0.0050"; FINAL_SINGLE_PASS="no"
+FINAL_MULTI_MBPS="1040"; FINAL_MULTI_RETRANS="10"; FINAL_MULTI_RETRANS_PERCENT="0.0030"; FINAL_MULTI_PASS="yes"
+FINAL_SCORE="41.6000"; FINAL_PASS="no"
+OUTCOME="optimized-runtime"; BEST_KIND="candidate-2"; BEST_BUFFER_MIB="64"; BEST_FACTOR="2.98"
+BEST_SINGLE_MBPS="260"; BEST_MULTI_MBPS="1040"; QOS_DETECTED="1"; SEARCH_ROUNDS="4"; OVERSHOOT_DETECTED="1"; OVERSHOOT_MIB="128"
+sysctl_get() {
+  case "$1" in
+    net.ipv4.tcp_congestion_control) echo bbr ;;
+    net.ipv4.tcp_rmem) echo '4096 131072 67108864' ;;
+    net.ipv4.tcp_wmem) echo '4096 16384 67108864' ;;
+    net.ipv4.tcp_mem) echo '699050 1048576 1398101' ;;
+  esac
+}
 root_qdisc_kind() { echo fq; }
 write_comparison eth0 67108864 >/dev/null
-grep -q '下载速度提高 53.33%' "$COMPARISON_FILE" || fail "plain-language throughput delta"
-grep -q '单流 QoS 特征：是' "$COMPARISON_FILE" || fail "comparison QoS flag"
-grep -q '已在 128 MiB 检测到性能回落' "$COMPARISON_FILE" || fail "plain-language overshoot summary"
+for text in \
+  'TCP/BBR 参数优化评估报告' \
+  '联合模型：单连接与 8 连接场景等权评估' \
+  'TCP 聚合内存预算：5461.00 MiB' \
+  '| 单连接吞吐 | 200 Mbps | 260 Mbps | 30.00% |' \
+  '| 8 连接聚合吞吐 | 900 Mbps | 1040 Mbps | 15.56% |' \
+  '| tcp_mem | 196608 262144 393216 | 699050 1048576 1398101 |' \
+  '在 128 MiB 检测到综合性能回落' \
+  '最终复核：候选参数'; do
+  grep -Fq "$text" "$COMPARISON_FILE" || fail "technical report field missing: $text"
+done
 
 printf 'All remote-role tests passed.\n'
