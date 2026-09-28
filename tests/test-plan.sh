@@ -1,29 +1,38 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="${ROOT}/bbr-tune.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/bbr-tune.sh"
 
-assert_contains() {
-  local haystack="$1" needle="$2"
-  [[ "$haystack" == *"$needle"* ]] || { printf 'ASSERT FAILED: missing %s\n' "$needle" >&2; exit 1; }
-}
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+assert_eq() { [[ "$1" == "$2" ]] || fail "$3: expected '$2', got '$1'"; }
 
-out="$($SCRIPT plan --profile hard-cap --cap-mbps 200 --bandwidth-mbps 200 --rtt-ms 30 --runtime-only)"
-assert_contains "$out" "resolved_profile=hard-cap"
-assert_contains "$out" "BDP：750000 bytes"
-assert_contains "$out" "推荐缓冲上限：2 MiB"
-assert_contains "$out" "整形速率：190 Mbps"
-assert_contains "$out" "TBF burst：32768 bytes"
+calculate_memory_buffer_cap 1024 512
+assert_eq "$MEM_BUFFER_CAP_MIB" "16" "1 GiB memory cap"
+calculate_memory_buffer_cap 8192 4096
+assert_eq "$MEM_BUFFER_CAP_MIB" "128" "8 GiB memory cap"
+calculate_memory_buffer_cap 65536 32768
+assert_eq "$MEM_BUFFER_CAP_MIB" "256" "large memory ceiling"
+calculate_memory_buffer_cap 256 64
+assert_eq "$MEM_BUFFER_CAP_MIB" "4" "small memory floor"
 
-out="$($SCRIPT plan --profile lfn --bandwidth-mbps 1000 --rtt-ms 180 --runtime-only)"
-assert_contains "$out" "resolved_profile=lfn"
-assert_contains "$out" "BDP：22500000 bytes"
-assert_contains "$out" "推荐缓冲上限：32 MiB"
+TARGET_MBPS="1000"
+RTT_MS="180"
+MEM_BUFFER_CAP_MIB="128"
+MAX_CANDIDATES="4"
+calculate_bdp
+assert_eq "$BDP_BYTES" "22500000" "BDP bytes"
+assert_eq "$BDP_MIB" "21.46" "BDP MiB"
+generate_candidates
+assert_eq "${CANDIDATE_MIBS[*]}" "32 64 128" "memory-aware candidate list"
+assert_eq "${CANDIDATE_FACTORS[*]}" "1.0 1.5 3.0" "candidate factors"
 
-out="$($SCRIPT plan --profile auto --bandwidth-mbps 500 --rtt-ms 180 --runtime-only)"
-assert_contains "$out" "resolved_profile=lfn"
+TARGET_MBPS="200"
+RTT_MS="30"
+MEM_BUFFER_CAP_MIB="16"
+calculate_bdp
+assert_eq "$BDP_BYTES" "750000" "short-link BDP"
+generate_candidates
+assert_eq "${CANDIDATE_MIBS[0]}" "4" "minimum candidate"
 
-out="$($SCRIPT plan --profile auto --bandwidth-mbps 500 --rtt-ms 30 --loss-percent 3 --runtime-only)"
-assert_contains "$out" "resolved_profile=lossy"
-
-printf 'All plan tests passed.\n'
+printf 'All memory-plan tests passed.\n'

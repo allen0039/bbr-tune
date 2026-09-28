@@ -1,216 +1,227 @@
-# 远程服务器 BBR / TCP 交互调优脚本
+# 远程服务器 TCP / BBR 自动寻优工具
 
-`bbr-tune.sh` 必须上传并运行在需要调优的 **远程 Linux 服务器** 上。脚本在服务器侧管理 BBR、TCP socket buffer、出口 qdisc、备份与回滚；本地电脑只执行脚本打印的 `ping` 和 `iperf3 -c ... -R` 命令。
+`bbr-tune.sh` 是一个运行在 **远程 Linux 服务器** 上的 TCP/BBR 自动测试与参数寻优脚本。
 
-> 脚本不会修改本地电脑的 sysctl、拥塞算法、路由、qdisc、防火墙或软件包。
+脚本只调整服务器端最核心的 TCP 参数：
 
-## 功能概览
+- `net.ipv4.tcp_congestion_control = bbr`
+- `net.core.default_qdisc = fq`
+- `net.core.rmem_max` / `net.core.wmem_max`
+- `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem`
+- `tcp_moderate_rcvbuf`、SACK、DSACK、窗口缩放
 
-- 缺少 `iperf3` 时，使用服务器包管理器自动安装；
-- 每次测速自动在 `20000～59999` 中选择未占用的随机 TCP 端口；
-- 本地客户端执行反向测速，服务器端自动读取 `iperf3` JSON 结果；
-- 根据吞吐和估算重传比例多轮调整服务器参数，并自动测试 1/8/16 并发流；
-- 达标后保留最终运行时参数，可选择持久化；
-- 达不到条件、执行出错或收到中断时恢复调优前基线；
-- 修改出口 qdisc 前建立 SSH 安全回滚任务。
+已移除手动场景 Profile、固定 TBF 方案、独立 iperf3 服务管理、手工计划生成等非核心流程。现在的主流程是：**基线测试 → 内存感知候选生成 → 多轮实测 → 性能平台判断 → 最优候选复测 → 前后对比与日志留存**。
 
-## 一、运行位置和测速方向
+> 本地电脑只运行脚本显示的 `iperf3 -c ... -R` 命令。脚本不会修改本地电脑的 TCP、路由、qdisc、防火墙或软件包。
 
-| 位置 | 命令 | 作用 |
-|---|---|---|
-| 远程服务器 | `sudo ./bbr-tune.sh` | 交互检测、自动调优、持久化和回滚 |
-| 远程服务器 | `iperf3 -s -1 -J -p <随机端口>` | 由脚本自动启动的一次性测试服务 |
-| 本地客户端 | `ping <服务器IP>` | 测量端到端 RTT |
-| 本地客户端 | `iperf3 -c <服务器IP> -p <随机端口> -R ...` | 测量服务器到本地的回程吞吐 |
+## 一、核心特性
 
-服务器不会反向运行 `iperf3 -c` 连接本地电脑，因此不要求本地电脑具有公网地址。
+### 1. 自动测试并选择实测最优值
 
-## 二、安装与启动
+脚本不再遇到第一个达标参数就结束，而是：
 
-在本地电脑把脚本上传到服务器：
+1. 测试服务器调优前性能；
+2. 单流低重传但吞吐不足时，自动继续测试 8 流和 16 流；
+3. 根据 BDP 和服务器可用内存生成多组 TCP 缓存候选；
+4. 逐组应用并等待本地反向测速；
+5. 综合吞吐、重传率和达标情况计算候选分数；
+6. 连续两个更大缓存没有改善时判定进入性能平台；
+7. 重新应用并复测最优候选；
+8. 如果复测低于调优前基线，自动恢复原参数。
 
-```bash
-scp bbr-tune.sh root@<服务器IP>:/root/
-ssh root@<服务器IP>
-chmod +x /root/bbr-tune.sh
-sudo /root/bbr-tune.sh
+### 2. 按服务器内存计算缓存上限
+
+不再使用固定的 `128 MiB` 上限。脚本读取：
+
+- `/proc/meminfo` 的物理内存和可用内存；
+- cgroup v1/v2 内存限制；
+- 链路 BDP；
+- 用户设置的目标带宽和 RTT。
+
+默认单连接 TCP 缓存预算约为：
+
+```text
+min(有效总内存 / 64, 当前可用内存 / 16, 256 MiB)
 ```
 
-也可以从 GitHub 下载：
+随后向下取 2 的幂，并保持至少 `4 MiB`。因此缓存预算会随服务器规格变化，例如：
+
+| 有效内存 | 典型自动上限 |
+|---:|---:|
+| 256 MiB | 4 MiB |
+| 1 GiB | 16 MiB |
+| 2 GiB | 32 MiB |
+| 4 GiB | 64 MiB |
+| 8 GiB | 128 MiB |
+| 16 GiB 及以上 | 最高 256 MiB，同时受可用内存约束 |
+
+候选值按 BDP 的 `1.0、1.5、2.0、3.0、4.0` 倍生成，向上取 2 的幂，并受上述内存预算限制。重复候选会自动去除。
+
+### 3. 完整运行日志和时间段对比
+
+每次运行创建独立会话目录：
+
+```text
+/var/lib/bbr-tcp-tuning/sessions/<时间戳-PID>/
+```
+
+其中包括：
+
+```text
+run.log                 屏幕输出和测试运行日志
+results.tsv             每一轮的参数、吞吐、Retr、重传率和评分
+comparison.txt          调优前后详细对比
+system-before.txt       调优前 sysctl、qdisc、TCP 计数器
+system-after.txt        调优后 sysctl、qdisc、TCP 计数器
+before-*.json           调优前原始 iperf3 JSON
+candidate-*.json        每个候选的原始 iperf3 JSON
+final-*.json            最优候选复测 JSON
+*.err                    对应测试的错误输出
+```
+
+跨时间段汇总保存在：
+
+```text
+/var/lib/bbr-tcp-tuning/history.tsv
+```
+
+可通过菜单或命令查看：
+
+```bash
+./bbr-tune.sh history
+```
+
+## 二、安装与运行
+
+在服务器上执行：
 
 ```bash
 git clone https://github.com/dingding229/bbr-tune.git
 cd bbr-tune
+chmod +x bbr-tune.sh
 sudo ./bbr-tune.sh
 ```
 
-支持的 `iperf3` 自动安装包管理器：`apt-get`、`dnf`、`yum`、`zypper`、`apk`、`pacman`。自动闭环解析优先使用服务器已有的 Python 3，没有 Python 3 时使用脚本内置的 `awk` 解析器，不会额外安装 `jq`。
-
-## 三、交互菜单
+如果服务器没有 `iperf3`，脚本会使用以下包管理器之一自动安装：
 
 ```text
-1) 检测服务器并自动安装 iperf3
-2) 管理服务器端 iperf3 测速服务（随机端口）
-3) 自动闭环测试并调优服务器 BBR（推荐）
-4) 根据客户端数据生成方案（不修改服务器）
-5) 手动临时应用方案
-6) 手动持久化应用方案
-7) 确认配置并取消自动回滚
-8) 验证服务器当前配置
-9) 立即回滚配置
-10) 查看命令行帮助
-0) 退出
+apt-get / dnf / yum / zypper / apk / pacman
 ```
 
-## 四、推荐：自动闭环调优
+不会额外安装 `jq`。解析测试结果时优先使用服务器已有的 Python 3；没有 Python 3 时使用内置 `awk` 解析器。
 
-### 1. 先在本地测量 RTT
+## 三、精简后的交互界面
+
+```text
+╔══════════════════════════════════════════════════════════════╗
+║        远程服务器 TCP / BBR 自动寻优工具 v2.0.0             ║
+╚══════════════════════════════════════════════════════════════╝
+
+  1) 自动测试并选择最优 TCP 参数
+  2) 查看当前 TCP / BBR 状态
+  3) 查看历史测试与对比记录
+  4) 确认保留当前参数
+  5) 恢复调优前参数
+  6) 使用说明
+  0) 退出
+```
+
+交互界面只保留自动寻优、状态、历史、确认和回滚等核心操作。
+
+## 四、命令行自动寻优
+
+先在本地测量 RTT：
 
 ```bash
 ping -c 20 <服务器IP>
 ```
 
-### 2. 在远程服务器启动自动调优
-
-交互菜单选择 `3`，或直接执行：
+然后在远程服务器执行：
 
 ```bash
 sudo ./bbr-tune.sh autotune \
-  --profile auto \
   --bandwidth-mbps 1000 \
   --rtt-ms 180 \
+  --server-address <服务器公网IP或域名> \
   --parallel 1 \
   --duration 15 \
+  --max-candidates 4 \
   --target-utilization 90 \
   --max-retrans-percent 1 \
-  --max-iterations 4 \
-  --test-wait-seconds 300 \
-  --auto-rollback-seconds 3600 \
-  --server-address <服务器公网IP或域名>
+  --wait-seconds 300 \
+  --auto-rollback-seconds 3600
 ```
 
-脚本会自动：
+每轮服务器会显示一个随机端口和本地测试命令，例如：
 
-1. 检查并安装服务器端 `iperf3`；
-2. 选择一个未占用的随机端口；
-3. 启动基线测试服务并打印本地客户端命令；
-4. 由服务器读取测试结果；
-5. 如果单流低重传但吞吐不足，后续轮次自动打印 `-P 8`、`-P 16` 测试命令；
-6. 如果基线已经达标，不修改任何 TCP/BBR 参数；
-7. 如果未达标，备份服务器基线并建立自动回滚；
-8. 应用一组服务器参数，等待下一轮本地测试；
-9. 达标则停止，未达标则继续调整，最多执行指定轮数；
-10. 所有候选方案都不达标时自动恢复原始服务器配置。
+```bash
+iperf3 -c <服务器IP> -p 43817 -R -P 1 -t 15 -i 1
+```
 
-每一轮都需要在 **本地电脑** 执行服务器屏幕上新打印的命令，例如：
+如果检测到低重传、低单流吞吐，后续命令会自动变为：
 
 ```bash
 iperf3 -c <服务器IP> -p 43817 -R -P 8 -t 15 -i 1
+iperf3 -c <服务器IP> -p 43817 -R -P 16 -t 15 -i 1
 ```
 
-脚本只会显示命令，不会在本地电脑运行或安装任何东西。
+脚本测试时每 5 秒显示等待/运行状态；测试完成后输出每秒吞吐和 Retr 区间日志，以及本轮汇总结果。
 
-### 3. 自动调整规则
+## 五、最优参数判定
 
-每轮同时检查：
+每轮计算：
 
 ```text
-吞吐 >= 目标带宽 × target-utilization
-估算重传比例 <= max-retrans-percent
+最低达标吞吐 = 目标带宽 × target-utilization
+估算重传比例 = Retr × 1448 / 发送字节数 × 100%
 ```
 
-估算重传比例使用服务器发送端统计：
+评分优先级：
 
-```text
-Retr × 1448 / 发送字节数 × 100%
-```
+1. 同时满足吞吐和重传阈值的候选优先；
+2. 未达标候选按吞吐完成度评分；
+3. 超过重传阈值会扣分；
+4. 连续两个更大缓存没有提升时停止扩大缓存；
+5. 最优候选必须再次复测；
+6. 复测低于原始基线时恢复原参数。
 
-自动策略：
-
-- **重传超标**：启用或收紧服务器出口 TBF 预整形，并在其下使用 `fq`；
-- **重传很低但单流吞吐不足**：自动把下一轮客户端命令提升为 `-P 8`，仍不足时提升为 `-P 16`，用于识别运营商单流 QoS；
-- **16 流仍不足**：仅当确实能增大服务器有效缓冲上限时，才按 `1.35 → 2.0 → 3.0 → 4.0` 提高 BDP 缓冲系数；
-- **整形安全下限**：至少保留目标利用率上方约 2 个百分点，避免为了降重传而必然破坏吞吐目标；
-- **无安全调整空间**：提前停止并恢复服务器基线。交互模式会将其报告为“目标未达到、基线已恢复”，而不是脚本执行错误。
-
-自动调优默认只修改当前运行时。希望达标后写入持久化配置时，增加：
+默认最多测试 4 个不同候选，可使用：
 
 ```bash
---persist-on-success
+--max-candidates 1..6
 ```
 
-### 4. 确认或回滚
+增加候选数意味着需要在本地执行更多轮 iperf3 命令。
 
-达标后，先另开一个 SSH 会话验证登录和业务，再确认保留：
+## 六、调优前后详细对比
+
+结束后屏幕和 `comparison.txt` 会显示：
+
+- 内核和出口网卡；
+- 服务器总内存、可用内存、cgroup 内存上限；
+- 自动计算的 TCP 缓存预算；
+- BDP；
+- 调优前后拥塞算法；
+- 调优前后 qdisc；
+- 调优前后 `tcp_rmem` / `tcp_wmem`；
+- 调优前后全局缓存上限；
+- 调优前后吞吐；
+- 调优前后 Retr 和估算重传比例；
+- 吞吐变化百分比；
+- 重传比例变化；
+- 最优 BDP 系数；
+- 是否检测到单流 QoS 特征；
+- 原始日志及结果文件位置。
+
+## 七、持久化、确认和回滚
+
+默认只保留当前运行时最优参数。需要同时写入开机配置时增加：
 
 ```bash
-sudo ./bbr-tune.sh confirm
+--persist
 ```
 
-如需立即恢复：
-
-```bash
-sudo ./bbr-tune.sh rollback --yes
-```
-
-未执行 `confirm` 时，安全计时器到期会自动回滚。
-
-## 五、单独管理 iperf3 服务
-
-启动时自动安装 `iperf3`，并自动选择随机空闲端口：
-
-```bash
-sudo ./bbr-tune.sh iperf-start \
-  --iperf-port 0 \
-  --server-address <服务器公网IP或域名>
-```
-
-查看实际端口和本地客户端命令：
-
-```bash
-./bbr-tune.sh iperf-status \
-  --server-address <服务器公网IP或域名>
-```
-
-停止服务：
-
-```bash
-sudo ./bbr-tune.sh iperf-stop
-```
-
-也可以显式指定端口，但默认和推荐值是 `0`，代表自动随机端口。
-
-## 六、场景模型
-
-| Profile | 场景 | 服务器动作 |
-|---|---|---|
-| `auto` | 让脚本按 RTT 和实测结果判断 | 自动选择以下方案并在必要时切换预整形 |
-| `balanced` | 短/中 RTT 常规线路 | BBR + fq |
-| `hard-cap` | 宿主机、网关或端口硬限速 | TBF 预整形 + fq |
-| `qos` | 单流明显低于多流 | BBR + fq；测试和业务使用并发流 |
-| `lfn` | 跨洋高 RTT、大 BDP | 扩大 socket buffer 上限 + fq |
-| `lossy` | 随机丢包和抖动 | BBR + fq + SACK/DSACK |
-
-BDP 计算：
-
-```text
-BDP_bytes = bandwidth_mbps × 1,000,000 × RTT_ms / 1000 / 8
-buffer = BDP_bytes × buffer_factor
-```
-
-推荐缓冲值向上取 2 的幂次 MiB，默认限制为 `2～128 MiB`。除非显式使用 `--allow-buffer-shrink`，脚本不会把服务器已有的更大全局 buffer 上限调低。
-
-## 七、结果、持久化与文件
-
-每次自动调优结果保存在：
-
-```text
-/var/lib/bbr-tcp-tuning/autotune/<时间戳>/results.tsv
-```
-
-每轮原始 `iperf3` JSON 和错误输出也保存在该目录。
-
-持久化配置包括：
+持久化文件：
 
 ```text
 /etc/sysctl.d/99-bbr-tcp-tuning.conf
@@ -218,27 +229,50 @@ buffer = BDP_bytes × buffer_factor
 /etc/default/bbr-tcp-tuning
 /usr/local/sbin/bbr-tcp-qdisc
 /etc/systemd/system/bbr-tcp-tuning.service
-/var/lib/bbr-tcp-tuning/backups/<时间戳>/
 ```
 
-## 八、安全边界
+每次开始修改前都会备份原配置并建立安全回滚。测试完成后请另开一个 SSH 会话检查服务器，然后执行：
 
-1. 脚本只在远程服务器修改 TCP/BBR/qdisc；不会修改本地客户端。
-2. 脚本会自动安装服务器端 `iperf3`，但不会自动修改服务器防火墙或云安全组。
-3. 随机端口来自 `20000～59999`。必须在云安全组/防火墙中允许显示的端口；也可临时允许该范围后再收紧。
-4. 修改出口 qdisc 可能影响 SSH，因此自动调优在修改前创建备份并启动安全回滚。
-5. 检测到 `cake`、`htb`、`netem`、`mqprio`、`taprio` 等自定义 root qdisc 时，默认拒绝覆盖；审计后可显式使用 `--force`。
-6. 通用回滚无法完整重建任意复杂的 class/filter 树，原始 `tc -s -d qdisc` 输出会保存在备份目录。
-7. 自动回滚依赖脚本文件在计时结束前保持原路径，请勿在确认前移动或删除脚本。
-8. 自动调优是工程化试探，不保证所有跨境线路都能达到目标；运营商单流 QoS、物理丢包和云厂商 policer 仍可能成为外部上限。若只有 8/16 流达标，脚本会明确提示业务侧需要并发连接。
+```bash
+sudo ./bbr-tune.sh confirm
+```
+
+立即恢复调优前参数：
+
+```bash
+sudo ./bbr-tune.sh rollback --yes
+```
+
+如果脚本异常退出、测试超时或被中断，会立即尝试恢复原参数；安全计时器仍作为第二层保护。
+
+## 八、安全说明
+
+1. 脚本必须在远程 Linux 服务器运行。
+2. 脚本不会修改本地电脑。
+3. 随机测试端口范围为 `20000～59999`，脚本不会自动修改防火墙或云安全组。
+4. 如安全组不能开放该范围，需要在测试时临时允许屏幕显示的端口。
+5. 检测到自定义 root qdisc 时默认拒绝覆盖；确认可以覆盖后才能使用 `--force`。
+6. 自定义复杂 qdisc 的 class/filter 无法通用重建，使用 `--force` 前应自行备份。
+7. 不应在执行 `confirm` 前移动或删除脚本，否则安全回滚任务可能找不到脚本。
+8. 单流 QoS、物理线路上限、接收端性能及运营商策略无法仅靠服务器 TCP 参数消除。
 
 ## 九、开发测试
 
 ```bash
 bash -n bbr-tune.sh
 bash tests/test-plan.sh
-bash tests/test-remote-logic.sh
 bash tests/test-autotune-logic.sh
+bash tests/test-remote-logic.sh
 ```
 
-测试覆盖 BDP 方案、远程角色方向、SSH 回滚标记、iperf JSON 解析、达标判断、自动调整规则和随机端口选择。真正的 `tc`、`sysctl`、systemd 和发行版包管理器行为仍需在 Linux 测试机验证。
+当前单元测试覆盖：
+
+- 内存感知缓存预算；
+- BDP 和候选参数生成；
+- iperf3 自动安装；
+- Python/awk JSON 解析；
+- 吞吐、重传和评分判断；
+- 1/8/16 流测试递进；
+- 随机端口和端口占用检测；
+- 安全回滚标记；
+- 调优前后对比文件。
