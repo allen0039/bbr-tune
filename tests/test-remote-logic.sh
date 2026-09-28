@@ -84,14 +84,23 @@ root_qdisc_kind() { echo fq; }
 write_comparison eth0 67108864 >/dev/null
 for text in \
   'TCP/BBR 参数优化评估报告' \
+  '[5] 性能对比' \
   '联合模型：单连接与 8 连接场景等权评估' \
   'TCP 聚合内存预算：5461.00 MiB' \
-  '| 单连接吞吐 | 200 Mbps | 260 Mbps | 30.00% |' \
-  '| 8 连接聚合吞吐 | 900 Mbps | 1040 Mbps | 15.56% |' \
-  '| tcp_mem | 196608 262144 393216 | 699050 1048576 1398101 |' \
+  '单连接吞吐' \
+  '  - 调优后：260 Mbps' \
+  '8 连接聚合吞吐' \
+  '  - 调优后：1040 Mbps' \
+  'tcp_mem' \
+  '  - 调优前：196608 262144 393216' \
+  '  - 调优后：699050 1048576 1398101' \
   '在 128 MiB 检测到综合性能回落' \
-  '最终复核：候选参数'; do
+  '最终复核：最优候选' \
+  '[复核 / 轮次 4]' \
+  '单连接（1 流）：260 Mbps' \
+  '多连接（8 流）：1040 Mbps'; do
   grep -Fq "$text" "$COMPARISON_FILE" || fail "technical report field missing: $text"
 done
+if grep -q '^|' "$COMPARISON_FILE"; then fail "terminal report must not contain markdown table rows"; fi
 
 printf 'All remote-role tests passed.\n'

@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -1211,12 +1211,14 @@ stop_tuning_on_signal() {
 }
 
 write_comparison() {
-  local iface="$1" final_buffer="$2" single_delta multi_delta single_retrans_delta multi_retrans_delta
+  local iface="$1" final_buffer="$2"
+  local single_delta multi_delta single_retrans_delta multi_retrans_delta score_delta
   local after_cc after_qdisc after_rmem after_wmem after_tcp_mem disposition boundary assessment
-  single_delta="$(awk -v a="$BASELINE_SINGLE_MBPS" -v b="$FINAL_SINGLE_MBPS" 'BEGIN {if(a<=0)print "0.00";else printf "%.2f",(b-a)/a*100}')"
-  multi_delta="$(awk -v a="$BASELINE_MULTI_MBPS" -v b="$FINAL_MULTI_MBPS" 'BEGIN {if(a<=0)print "0.00";else printf "%.2f",(b-a)/a*100}')"
-  single_retrans_delta="$(awk -v a="$BASELINE_SINGLE_RETRANS_PERCENT" -v b="$FINAL_SINGLE_RETRANS_PERCENT" 'BEGIN {printf "%.4f",b-a}')"
-  multi_retrans_delta="$(awk -v a="$BASELINE_MULTI_RETRANS_PERCENT" -v b="$FINAL_MULTI_RETRANS_PERCENT" 'BEGIN {printf "%.4f",b-a}')"
+  single_delta="$(awk -v a="$BASELINE_SINGLE_MBPS" -v b="$FINAL_SINGLE_MBPS" 'BEGIN {if(a<=0)print "0.00";else printf "%+.2f",(b-a)/a*100}')"
+  multi_delta="$(awk -v a="$BASELINE_MULTI_MBPS" -v b="$FINAL_MULTI_MBPS" 'BEGIN {if(a<=0)print "0.00";else printf "%+.2f",(b-a)/a*100}')"
+  single_retrans_delta="$(awk -v a="$BASELINE_SINGLE_RETRANS_PERCENT" -v b="$FINAL_SINGLE_RETRANS_PERCENT" 'BEGIN {printf "%+.4f",b-a}')"
+  multi_retrans_delta="$(awk -v a="$BASELINE_MULTI_RETRANS_PERCENT" -v b="$FINAL_MULTI_RETRANS_PERCENT" 'BEGIN {printf "%+.4f",b-a}')"
+  score_delta="$(awk -v a="$BASELINE_SCORE" -v b="$FINAL_SCORE" 'BEGIN {printf "%+.4f",b-a}')"
   after_cc="$(sysctl_get net.ipv4.tcp_congestion_control)"
   after_qdisc="$(root_qdisc_kind "$iface")"
   after_rmem="$(sysctl_get net.ipv4.tcp_rmem)"
@@ -1241,25 +1243,31 @@ write_comparison() {
   fi
 
   cat >"$COMPARISON_FILE" <<EOF_COMPARE
+================================================================
 TCP/BBR 参数优化评估报告
-========================
+================================================================
 
-执行结论
---------
-处置结果：${disposition}
-综合判定：${assessment}
-搜索收敛：${boundary}
+[1] 执行结论
+----------------------------------------------------------------
+处置结果：
+  ${disposition}
 
-评估方法
---------
+综合判定：
+  ${assessment}
+
+搜索收敛：
+  ${boundary}
+
+[2] 评估方法
+----------------------------------------------------------------
 测试方向：远程服务器 → 本地电脑（iperf3 反向测试）
-联合模型：单连接与 ${BALANCE_MULTI_STREAMS} 连接场景等权评估，采用调和均值抑制单侧性能偏科
-保护条件：候选配置的单连接和多连接吞吐均不得低于对应基线的 ${BALANCE_MIN_RETENTION_PERCENT}%
+联合模型：单连接与 ${BALANCE_MULTI_STREAMS} 连接场景等权评估，使用调和均值抑制单侧性能偏科
+保护条件：单连接和多连接吞吐均不得低于对应基线的 ${BALANCE_MIN_RETENTION_PERCENT}%
 选择原则：在满足保护条件的候选中，选择综合评分最高的配置
-最终复核：候选参数必须重新执行单连接与多连接测试；保护条件失效或综合评分低于基线时恢复原始配置
+最终复核：最优候选重新执行单连接与多连接测试；复核退化时恢复原始配置
 
-测试环境
---------
+[3] 测试环境
+----------------------------------------------------------------
 会话编号：${SESSION_ID}
 测试时间：$(date '+%Y-%m-%d %H:%M:%S %z')
 服务器地址：${SERVER_ADDRESS}
@@ -1270,40 +1278,75 @@ TCP/BBR 参数优化评估报告
 实测 TCP RTT：${RTT_MS} ms（${RTT_SOURCE}）
 候选搜索轮数：${SEARCH_ROUNDS}
 
-内存与 TCP 缓存策略
--------------------
+[4] 内存与 TCP 缓存策略
+----------------------------------------------------------------
 物理总内存：$(format_mib "$MEM_TOTAL_MIB")
-当前可用内存：$(format_mib "$MEM_AVAILABLE_MIB")（仅用于观测，不参与预算计算）
+当前可用内存：$(format_mib "$MEM_AVAILABLE_MIB")（仅观测，不参与预算计算）
 有效总内存：$(format_mib "$MEM_EFFECTIVE_MIB")（物理总内存与 cgroup 上限取较小值）
 TCP 聚合内存预算：$(format_mib "$MEM_TCP_BUDGET_MIB")（有效总内存的 2/3）
-单 socket 缓存搜索上限：$(format_mib "$MEM_BUFFER_CAP_MIB")（同时受内核整数范围约束）
+单 socket 缓存搜索上限：$(format_mib "$MEM_BUFFER_CAP_MIB")
 链路 BDP：${BDP_MIB} MiB
 TCP 内存页阈值：${TCP_MEM_LOW_PAGES} / ${TCP_MEM_PRESSURE_PAGES} / ${TCP_MEM_HIGH_PAGES}
 
-性能对比
---------
-| 指标 | 调优前 | 调优后 | 变化 |
-|---|---:|---:|---:|
-| 单连接吞吐 | ${BASELINE_SINGLE_MBPS} Mbps | ${FINAL_SINGLE_MBPS} Mbps | ${single_delta}% |
-| ${BALANCE_MULTI_STREAMS} 连接聚合吞吐 | ${BASELINE_MULTI_MBPS} Mbps | ${FINAL_MULTI_MBPS} Mbps | ${multi_delta}% |
-| 单连接估算重传率 | ${BASELINE_SINGLE_RETRANS_PERCENT}% | ${FINAL_SINGLE_RETRANS_PERCENT}% | ${single_retrans_delta} 个百分点 |
-| 多连接估算重传率 | ${BASELINE_MULTI_RETRANS_PERCENT}% | ${FINAL_MULTI_RETRANS_PERCENT}% | ${multi_retrans_delta} 个百分点 |
-| 综合评分 | ${BASELINE_SCORE} | ${FINAL_SCORE} | $(awk -v a="$BASELINE_SCORE" -v b="$FINAL_SCORE" 'BEGIN {printf "%.4f",b-a}') |
-| 联合目标是否达标 | $(format_pass "$BASELINE_PASS") | $(format_pass "$FINAL_PASS") | - |
+[5] 性能对比
+----------------------------------------------------------------
+单连接吞吐
+  - 调优前：${BASELINE_SINGLE_MBPS} Mbps
+  - 调优后：${FINAL_SINGLE_MBPS} Mbps
+  - 变化：${single_delta}%
 
-内核参数对比
-------------
-| 参数 | 调优前 | 调优后 |
-|---|---|---|
-| 拥塞控制算法 | ${BEFORE_CC} | ${after_cc} |
-| 出口队列规则 | ${BEFORE_QDISC} | ${after_qdisc} |
-| 缓存最大值 | $(format_bytes_mib "$BEFORE_BUFFER_BYTES") | $(format_bytes_mib "$final_buffer") |
-| tcp_rmem | ${BEFORE_RMEM} | ${after_rmem} |
-| tcp_wmem | ${BEFORE_WMEM} | ${after_wmem} |
-| tcp_mem | ${BEFORE_TCP_MEM} | ${after_tcp_mem} |
+${BALANCE_MULTI_STREAMS} 连接聚合吞吐
+  - 调优前：${BASELINE_MULTI_MBPS} Mbps
+  - 调优后：${FINAL_MULTI_MBPS} Mbps
+  - 变化：${multi_delta}%
 
-最优候选
---------
+单连接估算重传率
+  - 调优前：${BASELINE_SINGLE_RETRANS_PERCENT}%
+  - 调优后：${FINAL_SINGLE_RETRANS_PERCENT}%
+  - 变化：${single_retrans_delta} 个百分点
+
+多连接估算重传率
+  - 调优前：${BASELINE_MULTI_RETRANS_PERCENT}%
+  - 调优后：${FINAL_MULTI_RETRANS_PERCENT}%
+  - 变化：${multi_retrans_delta} 个百分点
+
+综合评分
+  - 调优前：${BASELINE_SCORE}
+  - 调优后：${FINAL_SCORE}
+  - 变化：${score_delta}
+
+联合目标状态
+  - 调优前：$([[ "$BASELINE_PASS" == "yes" ]] && echo "达标" || echo "未达标")
+  - 调优后：$([[ "$FINAL_PASS" == "yes" ]] && echo "达标" || echo "未达标")
+
+[6] 内核参数对比
+----------------------------------------------------------------
+拥塞控制算法
+  - 调优前：${BEFORE_CC}
+  - 调优后：${after_cc}
+
+出口队列规则
+  - 调优前：${BEFORE_QDISC}
+  - 调优后：${after_qdisc}
+
+缓存最大值
+  - 调优前：$(format_bytes_mib "$BEFORE_BUFFER_BYTES")
+  - 调优后：$(format_bytes_mib "$final_buffer")
+
+tcp_rmem
+  - 调优前：${BEFORE_RMEM}
+  - 调优后：${after_rmem}
+
+tcp_wmem
+  - 调优前：${BEFORE_WMEM}
+  - 调优后：${after_wmem}
+
+tcp_mem
+  - 调优前：${BEFORE_TCP_MEM}
+  - 调优后：${after_tcp_mem}
+
+[7] 最优候选
+----------------------------------------------------------------
 候选标识：${BEST_KIND}
 缓存上限：${BEST_BUFFER_MIB} MiB
 缓存 / BDP：${BEST_FACTOR} 倍
@@ -1313,15 +1356,62 @@ TCP 内存页阈值：${TCP_MEM_LOW_PAGES} / ${TCP_MEM_PRESSURE_PAGES} / ${TCP_M
 EOF_COMPARE
 
   {
-    printf '\n逐轮测试明细\n------------\n'
-    printf '| 阶段 | 轮次 | 模式 | 并发 | 缓存 MiB | RTT ms | 吞吐 Mbps | 重传率 | 单项达标 | 综合评分 | 保护条件 |\n'
-    printf '|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n'
-    awk -F '\t' 'NR>1 {passed=($13=="yes"?"是":"否"); eligible=($15=="yes"?"是":($15=="no"?"否":"-")); pair=($14==""?"-":$14); printf "| %s | %s | %s | %s | %s | %s | %s | %s%% | %s | %s | %s |\n",$1,$2,$3,$5,$6,$8,$9,$11,passed,pair,eligible}' "$REPORT_FILE"
-    printf '\n审计文件\n--------\n'
-    printf '完整运行日志：%s\n' "$RUN_LOG"
-    printf '结构化逐轮数据：%s\n' "$REPORT_FILE"
-    printf '调优前系统状态：%s/system-before.txt\n' "$SESSION_DIR"
-    printf '调优后系统状态：%s/system-after.txt\n' "$SESSION_DIR"
+    printf '\n[8] 逐轮测试明细\n'
+    printf '%s\n' '----------------------------------------------------------------'
+    awk -F '\t' '
+      function stage_name(value) {
+        if (value=="before") return "基线"
+        if (value=="candidate") return "候选"
+        if (value=="final") return "复核"
+        return value
+      }
+      function result_name(value) { return (value=="yes" ? "达标" : "未达标") }
+      function guard_name(value) {
+        if (value=="yes") return "通过"
+        if (value=="no") return "未通过"
+        return "未评价"
+      }
+      function emit_pair() {
+        if (!have_single) return
+        printf "[%s / 轮次 %s]\n", stage_name(pair_stage), pair_round
+        printf "  配置：缓存 %s MiB | RTT %s ms\n", pair_buffer, pair_rtt
+        printf "  综合：评分 %s | 保护条件 %s\n", pair_score, guard_name(pair_guard)
+        printf "  单连接（%s 流）：%s Mbps | 重传 %s%% | %s\n", single_streams, single_mbps, single_retrans, result_name(single_pass)
+        if (have_multi)
+          printf "  多连接（%s 流）：%s Mbps | 重传 %s%% | %s\n", multi_streams, multi_mbps, multi_retrans, result_name(multi_pass)
+        else
+          print "  多连接：无测试记录"
+        print ""
+        have_single=0
+        have_multi=0
+      }
+      NR==1 { next }
+      $3=="single" {
+        emit_pair()
+        pair_stage=$1; pair_round=$2; pair_buffer=$6; pair_rtt=$8
+        pair_score=($14=="" ? "-" : $14); pair_guard=$15
+        single_streams=$5; single_mbps=$9; single_retrans=$11; single_pass=$13
+        have_single=1
+        next
+      }
+      $3=="multi" && have_single {
+        multi_streams=$5; multi_mbps=$9; multi_retrans=$11; multi_pass=$13
+        have_multi=1
+        emit_pair()
+        next
+      }
+      {
+        printf "[%s / 轮次 %s]\n", stage_name($1), $2
+        printf "  %s（%s 流）：%s Mbps | 重传 %s%% | %s\n\n", $3, $5, $9, $11, result_name($13)
+      }
+      END { emit_pair() }
+    ' "$REPORT_FILE"
+    printf '[9] 审计文件\n'
+    printf '%s\n' '----------------------------------------------------------------'
+    printf '完整运行日志：\n  %s\n' "$RUN_LOG"
+    printf '结构化逐轮数据：\n  %s\n' "$REPORT_FILE"
+    printf '调优前系统状态：\n  %s/system-before.txt\n' "$SESSION_DIR"
+    printf '调优后系统状态：\n  %s/system-after.txt\n' "$SESSION_DIR"
   } >>"$COMPARISON_FILE"
   cat "$COMPARISON_FILE"
 }
