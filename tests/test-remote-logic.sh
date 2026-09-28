@@ -27,8 +27,20 @@ schedule_rollback "$backup"
 pending="$(pending_path "$backup")"
 [[ -f "${pending}/armed" ]] || fail "rollback armed marker"
 [[ -L "$PENDING_LATEST" ]] || fail "rollback latest link"
+pending_guard
+[[ ! -e "$pending" ]] || fail "new autotune cancels previous pending rollback"
+[[ ! -e "$PENDING_LATEST" ]] || fail "new autotune removes previous pending link"
+
+# A broken latest symlink is stale state and must never block a new run.
+ln -sfn "${tmp}/missing-pending" "$PENDING_LATEST"
+pending_guard
+[[ ! -L "$PENDING_LATEST" ]] || fail "broken pending symlink cleanup"
+
+# Explicit cancellation remains idempotent.
+mkdir -p "$backup"
+schedule_rollback "$backup"
 cancel_rollback_for_backup "$backup"
-[[ ! -e "$pending" ]] || fail "rollback cancellation"
+[[ ! -e "$(pending_path "$backup")" ]] || fail "rollback cancellation"
 
 # Detailed before/after comparison is retained for later time-period analysis.
 SESSION_ID="test-session"

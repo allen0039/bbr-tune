@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -679,10 +679,12 @@ schedule_rollback() {
   warn "已启用 ${AUTO_ROLLBACK_SECONDS} 秒安全回滚；确认服务器正常后执行 sudo $PROGRAM confirm"
 }
 
-cancel_rollback_for_backup() {
-  local backup="$1" pending type="" id="" recorded real
-  pending="$(pending_path "$backup")"
-  [[ -d "$pending" ]] || return 0
+cancel_pending_dir() {
+  local pending="$1" type="" id="" recorded real
+  if [[ ! -d "$pending" ]]; then
+    [[ -L "$PENDING_LATEST" ]] && rm -f "$PENDING_LATEST"
+    return 0
+  fi
   if [[ -r "${pending}/timer.env" ]]; then
     local TYPE="" ID=""
     # shellcheck disable=SC1090
@@ -704,16 +706,46 @@ cancel_rollback_for_backup() {
   recorded="$(readlink -f "$PENDING_LATEST" 2>/dev/null || true)"
   real="$(readlink -f "$pending" 2>/dev/null || printf '%s' "$pending")"
   rm -rf "$pending"
-  if [[ "$recorded" == "$real" ]]; then rm -f "$PENDING_LATEST"; fi
+  if [[ "$recorded" == "$real" || -L "$PENDING_LATEST" && -z "$recorded" ]]; then
+    rm -f "$PENDING_LATEST"
+  fi
   return 0
 }
 
-pending_guard() {
-  local pending
-  pending="$(readlink -f "$PENDING_LATEST" 2>/dev/null || true)"
-  [[ -z "$pending" || ! -f "${pending}/armed" ]] || die "存在尚未确认的调优，请先执行 confirm 或 rollback"
+cancel_rollback_for_backup() {
+  cancel_pending_dir "$(pending_path "$1")"
 }
 
+pending_guard() {
+  local pending backup=""
+  pending="$(readlink -f "$PENDING_LATEST" 2>/dev/null || true)"
+  if [[ -z "$pending" ]]; then
+    if [[ -L "$PENDING_LATEST" ]]; then
+      rm -f "$PENDING_LATEST"
+      warn "已清理失效的安全回滚标记"
+    fi
+    return 0
+  fi
+  if [[ ! -d "$pending" ]]; then
+    rm -f "$PENDING_LATEST"
+    warn "已清理不存在的安全回滚记录"
+    return 0
+  fi
+  if [[ -r "${pending}/backup" ]]; then
+    backup="$(cat "${pending}/backup" 2>/dev/null || true)"
+  fi
+  if [[ -f "${pending}/armed" ]]; then
+    warn "检测到上一次调优尚未确认；新一轮调优将以当前服务器参数作为基线"
+    cancel_pending_dir "$pending"
+    info "已取消上一次安全回滚计时器，新会话可以继续"
+  else
+    cancel_pending_dir "$pending"
+    info "已清理上一次会话遗留的无效状态"
+  fi
+  if [[ -n "$backup" && ! -d "$backup" ]]; then
+    warn "上一次会话的备份目录已不存在：$backup"
+  fi
+}
 confirm_tuning() {
   require_linux; require_root
   local pending backup
