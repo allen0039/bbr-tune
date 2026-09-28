@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.3.1"
+VERSION="2.4.0"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -34,6 +34,8 @@ MAX_RETRANS_PERCENT="1"
 AUTO_ROLLBACK_SECONDS="3600"
 TCP_BUFFER_SYSCTL_MAX_MIB="2047"
 BALANCE_MIN_RETENTION_PERCENT="95"
+TUNING_QDISC="fq"
+VM_MIN_FREE_KBYTES="0"
 PERSIST_FINAL="0"
 FORCE="0"
 YES="0"
@@ -102,11 +104,11 @@ BASELINE_SCORE="-999999"
 BASELINE_PASS="no"
 BASELINE_BUFFER_BYTES="0"
 
-BEST_KIND="baseline"
+BEST_KIND="none"
 BEST_BUFFER_MIB="0"
-BEST_FACTOR="original"
+BEST_FACTOR="未选择"
 BEST_SCORE="-999999"
-
+BEST_ELIGIBLE="no"
 
 BEST_SINGLE_MBPS="0"
 BEST_SINGLE_RETRANS_PERCENT="100"
@@ -140,6 +142,37 @@ CANDIDATE_FACTORS=()
 SEARCH_ROUNDS="0"
 OVERSHOOT_DETECTED="0"
 OVERSHOOT_MIB="0"
+
+# Every mutable sysctl is declared once so backup, rollback, state capture and
+# reporting always cover the same server-side settings.
+TUNING_SYSCTL_KEYS=(
+  kernel.pid_max kernel.panic kernel.sysrq kernel.core_pattern kernel.printk
+  kernel.numa_balancing kernel.sched_autogroup_enabled
+  vm.swappiness vm.dirty_ratio vm.dirty_background_ratio vm.panic_on_oom
+  vm.overcommit_memory vm.min_free_kbytes
+  net.core.default_qdisc net.core.netdev_max_backlog net.core.rmem_max
+  net.core.wmem_max net.core.rmem_default net.core.wmem_default
+  net.core.somaxconn net.core.optmem_max
+  net.ipv4.tcp_fastopen net.ipv4.tcp_timestamps net.ipv4.tcp_tw_reuse
+  net.ipv4.tcp_fin_timeout net.ipv4.tcp_slow_start_after_idle
+  net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_sack net.ipv4.tcp_dsack
+  net.ipv4.tcp_fack net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem
+  net.ipv4.tcp_mtu_probing net.ipv4.tcp_congestion_control
+  net.ipv4.tcp_notsent_lowat net.ipv4.tcp_window_scaling
+  net.ipv4.tcp_adv_win_scale net.ipv4.tcp_moderate_rcvbuf
+  net.ipv4.tcp_no_metrics_save net.ipv4.tcp_max_syn_backlog
+  net.ipv4.tcp_max_orphans net.ipv4.tcp_synack_retries
+  net.ipv4.tcp_syn_retries net.ipv4.tcp_abort_on_overflow
+  net.ipv4.tcp_stdurg net.ipv4.tcp_rfc1337 net.ipv4.tcp_syncookies
+  net.ipv4.ip_local_port_range net.ipv4.ip_no_pmtu_disc
+  net.ipv4.route.gc_timeout net.ipv4.neigh.default.gc_stale_time
+  net.ipv4.neigh.default.gc_thresh3 net.ipv4.neigh.default.gc_thresh2
+  net.ipv4.neigh.default.gc_thresh1 net.ipv4.icmp_echo_ignore_broadcasts
+  net.ipv4.icmp_ignore_bogus_error_responses net.ipv4.conf.all.rp_filter
+  net.ipv4.conf.default.rp_filter net.ipv4.conf.all.arp_announce
+  net.ipv4.conf.default.arp_announce net.ipv4.conf.all.arp_ignore
+  net.ipv4.conf.default.arp_ignore
+)
 
 log_line() {
   local level="$1"; shift
@@ -187,10 +220,11 @@ usage() {
   2. 本地电脑只运行屏幕显示的 iperf3 客户端命令，不改任何本地参数。
   3. 首轮反向 iperf3 会自动测量本地与服务器之间的 TCP RTT，无需填写 RTT。
   4. TCP 聚合内存高水位按有效总内存的 2/3 计算，适用于专用网络代理服务器。
-  5. 每组参数分别测试单连接与多连接，任何一侧明显退化都不会被选为最优方案。
-  6. 候选数量不设人工上限：先持续增大缓存；发现综合性能边界后回退并二分精调。
-  7. 每轮固定等待本地连接 300 秒；修改后固定保留 3600 秒安全回滚窗口。
-  8. 所有结果和原始 JSON 长期保存在 /var/lib/bbr-tcp-tuning/sessions。
+  5. 每组参数分别测试单连接与多连接；满足双侧基线保护的候选优先，再按均衡评分选优。
+  6. 即使没有候选达到绝对目标，也会应用本次会话中实测综合表现最优的候选。
+  7. 候选数量不设人工上限：先持续增大缓存；发现综合性能边界后回退并二分精调。
+  8. 每轮固定等待本地连接 300 秒；修改后固定保留 3600 秒安全回滚窗口。
+  9. 所有结果和原始 JSON 长期保存在 /var/lib/bbr-tcp-tuning/sessions。
 USAGE
 }
 is_integer() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
@@ -423,6 +457,7 @@ calculate_memory_buffer_cap() {
   (( TCP_MEM_LOW_PAGES < 1 )) && TCP_MEM_LOW_PAGES=1
   (( TCP_MEM_PRESSURE_PAGES <= TCP_MEM_LOW_PAGES )) && TCP_MEM_PRESSURE_PAGES=$(( TCP_MEM_LOW_PAGES + 1 ))
   (( TCP_MEM_HIGH_PAGES <= TCP_MEM_PRESSURE_PAGES )) && TCP_MEM_HIGH_PAGES=$(( TCP_MEM_PRESSURE_PAGES + 1 ))
+  calculate_vm_min_free_kbytes "$total_mib"
   return 0
 }
 calculate_bdp() {
@@ -478,94 +513,209 @@ root_qdisc_kind() {
 }
 
 qdisc_safe() {
-  case "$1" in ""|noqueue|pfifo_fast|fq_codel|fq|mq) return 0 ;; *) return 1 ;; esac
+  case "$1" in ""|noqueue|pfifo_fast|fq_codel|fq|cake|mq) return 0 ;; *) return 1 ;; esac
 }
 
-apply_fq() {
-  local iface="$1" root parents parent
+select_tuning_qdisc() {
+  if modprobe sch_cake 2>/dev/null; then
+    TUNING_QDISC="cake"
+  else
+    modprobe sch_fq 2>/dev/null || true
+    TUNING_QDISC="fq"
+    warn "当前内核未提供 CAKE，队列调度器自动回退为 fq"
+  fi
+}
+
+apply_qdisc() {
+  local iface="$1" kind="$2" root parents parent
   root="$(root_qdisc_kind "$iface")"
   if [[ "$root" == "mq" ]]; then
     parents="$(tc qdisc show dev "$iface" | awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1)~/^:/) print $(i+1)}' | sort -u)"
     if [[ -n "$parents" ]]; then
       while read -r parent; do
-        [[ -n "$parent" ]] && tc qdisc replace dev "$iface" parent "$parent" fq
+        [[ -n "$parent" ]] && tc qdisc replace dev "$iface" parent "$parent" "$kind"
       done <<<"$parents"
       return
     fi
   fi
-  tc qdisc replace dev "$iface" root fq
+  tc qdisc replace dev "$iface" root "$kind"
 }
 
-read_tcp_vector() {
-  local key="$1" fallback="$2" value
-  value="$(sysctl_get "$key")"
-  if [[ "$value" =~ ^[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+$ ]]; then
-    printf '%s\n' "$value"
-  else
-    printf '%s\n' "$fallback"
-  fi
+calculate_vm_min_free_kbytes() {
+  local total_mib="${1:-$MEM_EFFECTIVE_MIB}" value
+  [[ "$total_mib" =~ ^[0-9]+$ ]] || total_mib=0
+  value=$(( total_mib * 1024 / 100 ))
+  (( value < 8192 )) && value=8192
+  (( value > 262144 )) && value=262144
+  VM_MIN_FREE_KBYTES="$value"
 }
 
 build_sysctl_content() {
-  local buffer_bytes="$1" rvec wvec rmin rdef wmin wdef
-  rvec="$(read_tcp_vector net.ipv4.tcp_rmem '4096 131072 6291456')"
-  wvec="$(read_tcp_vector net.ipv4.tcp_wmem '4096 16384 4194304')"
-  read -r rmin rdef _ <<<"$rvec"
-  read -r wmin wdef _ <<<"$wvec"
+  local buffer_bytes="$1"
+  (( VM_MIN_FREE_KBYTES > 0 )) || calculate_vm_min_free_kbytes "$MEM_EFFECTIVE_MIB"
   cat <<EOF_SYSCTL
 # Managed by bbr-tune.sh ${VERSION}; generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
-# TCP memory budget=${MEM_TCP_BUDGET_MIB}MiB (2/3 effective memory), per-socket cap=${MEM_BUFFER_CAP_MIB}MiB
-# Target=${TARGET_MBPS}Mbps, RTT=${RTT_MS}ms, BDP=${BDP_MIB}MiB
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+# TCP memory budget=${MEM_TCP_BUDGET_MIB}MiB (2/3 effective total memory), per-socket cap=${MEM_BUFFER_CAP_MIB}MiB
+# Target=${TARGET_MBPS}Mbps, RTT=${RTT_MS}ms, BDP=${BDP_MIB}MiB, qdisc=${TUNING_QDISC}
+
+# Process scheduling and failure handling for a dedicated proxy server
+kernel.pid_max = 65535
+kernel.panic = 1
+kernel.sysrq = 1
+kernel.core_pattern = core_%e
+kernel.printk = 3 4 1 3
+kernel.numa_balancing = 0
+kernel.sched_autogroup_enabled = 0
+
+# Virtual memory policy; min_free_kbytes is 1% of effective total memory,
+# clamped to 8 MiB..256 MiB instead of using a fixed value.
+vm.swappiness = 10
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+vm.panic_on_oom = 1
+vm.overcommit_memory = 1
+vm.min_free_kbytes = ${VM_MIN_FREE_KBYTES}
+
+# Network core
+net.core.default_qdisc = ${TUNING_QDISC}
+net.core.netdev_max_backlog = 2000
 net.core.rmem_max = ${buffer_bytes}
 net.core.wmem_max = ${buffer_bytes}
-net.ipv4.tcp_rmem = ${rmin} ${rdef} ${buffer_bytes}
-net.ipv4.tcp_wmem = ${wmin} ${wdef} ${buffer_bytes}
-net.ipv4.tcp_mem = ${TCP_MEM_LOW_PAGES} ${TCP_MEM_PRESSURE_PAGES} ${TCP_MEM_HIGH_PAGES}
-net.ipv4.tcp_moderate_rcvbuf = 1
+net.core.rmem_default = 87380
+net.core.wmem_default = 65536
+net.core.somaxconn = 889
+net.core.optmem_max = 65536
+
+# TCP data path
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_max_tw_buckets = 32768
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_fack = 0
+net.ipv4.tcp_rmem = 8192 87380 ${buffer_bytes}
+net.ipv4.tcp_wmem = 8192 65536 ${buffer_bytes}
+net.ipv4.tcp_mem = ${TCP_MEM_LOW_PAGES} ${TCP_MEM_PRESSURE_PAGES} ${TCP_MEM_HIGH_PAGES}
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_notsent_lowat = 4096
 net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = 4
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_no_metrics_save = 0
+
+# Connection queues and loss recovery
+net.ipv4.tcp_max_syn_backlog = 3556
+net.ipv4.tcp_max_orphans = 65536
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_abort_on_overflow = 0
+net.ipv4.tcp_stdurg = 0
+net.ipv4.tcp_rfc1337 = 0
+net.ipv4.tcp_syncookies = 1
+
+# IPv4 ports, path MTU, neighbour cache and interface hardening
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_no_pmtu_disc = 0
+net.ipv4.route.gc_timeout = 100
+net.ipv4.neigh.default.gc_stale_time = 120
+net.ipv4.neigh.default.gc_thresh3 = 8192
+net.ipv4.neigh.default.gc_thresh2 = 4096
+net.ipv4.neigh.default.gc_thresh1 = 1024
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.arp_announce = 2
+net.ipv4.conf.default.arp_announce = 2
+net.ipv4.conf.all.arp_ignore = 1
+net.ipv4.conf.default.arp_ignore = 1
 EOF_SYSCTL
 }
 
-apply_sysctl_content() {
-  local buffer_bytes="$1" raw filtered line key
-  raw="$(mktemp)"
-  filtered="$(mktemp)"
-  build_sysctl_content "$buffer_bytes" >"$raw"
+UNSUPPORTED_SYSCTL_KEYS_SEEN="|"
+REJECTED_SYSCTL_KEYS_SEEN="|"
+filter_supported_sysctl_file() {
+  local input="$1" output="$2" line key
+  : >"$output"
   while IFS= read -r line; do
     if [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]]; then
-      printf '%s\n' "$line" >>"$filtered"
+      printf '%s\n' "$line" >>"$output"
       continue
     fi
     key="${line%%=*}"
     key="${key//[[:space:]]/}"
-    if sysctl_exists "$key"; then
-      printf '%s\n' "$line" >>"$filtered"
+    if [[ "$REJECTED_SYSCTL_KEYS_SEEN" == *"|${key}|"* ]]; then
+      printf '# rejected by runtime: %s\n' "$line" >>"$output"
+    elif sysctl_exists "$key"; then
+      printf '%s\n' "$line" >>"$output"
     else
-      printf '# unsupported: %s\n' "$line" >>"$filtered"
-      warn "当前内核不支持 ${key}，已跳过"
+      printf '# unsupported: %s\n' "$line" >>"$output"
+      case "$UNSUPPORTED_SYSCTL_KEYS_SEEN" in
+        *"|${key}|"*) ;;
+        *) warn "当前内核不支持 ${key}，已跳过"; UNSUPPORTED_SYSCTL_KEYS_SEEN="${UNSUPPORTED_SYSCTL_KEYS_SEEN}${key}|" ;;
+      esac
     fi
-  done <"$raw"
-  sysctl -p "$filtered" >/dev/null
+  done <"$input"
+}
+
+apply_sysctl_content() {
+  local buffer_bytes="$1" raw filtered line key value
+  raw="$(mktemp)"
+  filtered="$(mktemp)"
+  build_sysctl_content "$buffer_bytes" >"$raw"
+  filter_supported_sysctl_file "$raw" "$filtered"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# || -z "$line" ]] && continue
+    key="${line%%=*}"; key="${key//[[:space:]]/}"
+    value="${line#*=}"; value="${value#${value%%[![:space:]]*}}"; value="${value%${value##*[![:space:]]}}"
+    if ! sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+      case "$REJECTED_SYSCTL_KEYS_SEEN" in
+        *"|${key}|"*) ;;
+        *) warn "运行环境拒绝写入 ${key}，已跳过并保留原值"; REJECTED_SYSCTL_KEYS_SEEN="${REJECTED_SYSCTL_KEYS_SEEN}${key}|" ;;
+      esac
+    fi
+  done <"$filtered"
   rm -f "$raw" "$filtered"
 }
 
 ensure_bbr() {
   modprobe tcp_bbr 2>/dev/null || true
-  modprobe sch_fq 2>/dev/null || true
   local available
   available="$(sysctl_get net.ipv4.tcp_available_congestion_control)"
   [[ " $available " == *" bbr "* ]] || die "当前内核不支持 BBR"
+  select_tuning_qdisc
+}
+
+validate_candidate_kernel_state() {
+  local expected="$1" rmax wmax rvec wvec rlimit wlimit cc
+  cc="$(sysctl_get net.ipv4.tcp_congestion_control)"
+  [[ "$cc" == "bbr" ]] || die "BBR 未能在当前内核生效"
+  rmax="$(sysctl_get net.core.rmem_max)"; wmax="$(sysctl_get net.core.wmem_max)"
+  rvec="$(sysctl_get net.ipv4.tcp_rmem)"; wvec="$(sysctl_get net.ipv4.tcp_wmem)"
+  rlimit="$(awk '{print $3}' <<<"$rvec")"; wlimit="$(awk '{print $3}' <<<"$wvec")"
+  for value in "$rmax" "$wmax" "$rlimit" "$wlimit"; do
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= expected )) || die "关键 TCP 缓存参数未能应用到 ${expected} bytes"
+  done
 }
 
 apply_candidate() {
   local iface="$1" buffer_mib="$2" buffer_bytes
   buffer_bytes=$(( buffer_mib * 1048576 ))
   apply_sysctl_content "$buffer_bytes"
-  apply_fq "$iface"
+  if ! apply_qdisc "$iface" "$TUNING_QDISC"; then
+    [[ "$TUNING_QDISC" == "cake" ]] || return 1
+    warn "CAKE 无法应用到出口网卡 ${iface}，本次会话自动回退为 fq"
+    TUNING_QDISC="fq"
+    REJECTED_SYSCTL_KEYS_SEEN="${REJECTED_SYSCTL_KEYS_SEEN//|net.core.default_qdisc|/|}"
+    modprobe sch_fq 2>/dev/null || true
+    apply_sysctl_content "$buffer_bytes"
+    apply_qdisc "$iface" "$TUNING_QDISC"
+  fi
+  validate_candidate_kernel_state "$buffer_bytes"
 }
 
 atomic_write() {
@@ -578,23 +728,29 @@ atomic_write() {
 }
 
 write_persistent_config() {
-  local iface="$1" buffer_mib="$2" buffer_bytes
+  local iface="$1" buffer_mib="$2" buffer_bytes raw filtered
   buffer_bytes=$(( buffer_mib * 1048576 ))
-  build_sysctl_content "$buffer_bytes" | atomic_write "$SYSCTL_FILE" 0644
-  cat <<'EOF_MODULES' | atomic_write "$MODULES_FILE" 0644
-# Managed by bbr-tune.sh
-tcp_bbr
-sch_fq
-EOF_MODULES
+  raw="$(mktemp)"; filtered="$(mktemp)"
+  build_sysctl_content "$buffer_bytes" >"$raw"
+  filter_supported_sysctl_file "$raw" "$filtered"
+  atomic_write "$SYSCTL_FILE" 0644 <"$filtered"
+  rm -f "$raw" "$filtered"
+  {
+    printf '# Managed by bbr-tune.sh\n'
+    printf 'tcp_bbr\n'
+    if [[ "$TUNING_QDISC" == "cake" ]]; then printf 'sch_cake\n'; else printf 'sch_fq\n'; fi
+  } | atomic_write "$MODULES_FILE" 0644
   cat <<EOF_ENV | atomic_write "$ENV_FILE" 0644
 # Managed by bbr-tune.sh
 BBR_IFACE=$(printf '%q' "$iface")
+BBR_QDISC=$(printf '%q' "$TUNING_QDISC")
 EOF_ENV
   cat <<'EOF_HELPER' | atomic_write "$QDISC_HELPER" 0755
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source /etc/default/bbr-tcp-tuning
 iface="$BBR_IFACE"
+kind="${BBR_QDISC:-fq}"
 if [[ "$iface" == "auto" ]]; then
   iface="$(ip -o route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 fi
@@ -602,15 +758,15 @@ root="$(tc qdisc show dev "$iface" | awk '$0~/ root /{print $2; exit}')"
 if [[ "$root" == "mq" ]]; then
   parents="$(tc qdisc show dev "$iface" | awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1)~/^:/) print $(i+1)}' | sort -u)"
   if [[ -n "$parents" ]]; then
-    while read -r parent; do [[ -n "$parent" ]] && tc qdisc replace dev "$iface" parent "$parent" fq; done <<<"$parents"
+    while read -r parent; do [[ -n "$parent" ]] && tc qdisc replace dev "$iface" parent "$parent" "$kind"; done <<<"$parents"
     exit 0
   fi
 fi
-tc qdisc replace dev "$iface" root fq
+tc qdisc replace dev "$iface" root "$kind"
 EOF_HELPER
   cat <<'EOF_SERVICE' | atomic_write "$SERVICE_FILE" 0644
 [Unit]
-Description=TCP BBR and fq setup
+Description=TCP BBR and selected queue discipline setup
 Wants=network-online.target
 After=network-online.target
 
@@ -627,7 +783,7 @@ EOF_SERVICE
     systemctl enable bbr-tcp-tuning.service >/dev/null
     systemctl restart bbr-tcp-tuning.service
   else
-    warn "系统没有 systemd：sysctl 配置已保存，但 fq qdisc 需要自行设置开机任务"
+    warn "系统没有 systemd：sysctl 配置已保存，但 ${TUNING_QDISC} qdisc 需要自行设置开机任务"
   fi
 }
 
@@ -663,11 +819,11 @@ SERVICE_ACTIVE=$(printf '%q' "$service_active")
 EOF_META
   tc -s -d qdisc show dev "$iface" >"${backup}/qdisc.txt" 2>&1 || true
   : >"${backup}/sysctl.tsv"
-  for key in net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max \
-    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_sack \
-    net.ipv4.tcp_dsack net.ipv4.tcp_window_scaling; do
-    value="$(sysctl_get "$key")"
-    [[ -n "$value" ]] && printf '%s\t%s\n' "$key" "$value" >>"${backup}/sysctl.tsv"
+  for key in "${TUNING_SYSCTL_KEYS[@]}"; do
+    if sysctl_exists "$key"; then
+      value="$(sysctl_get "$key")"
+      printf '%s\t%s\n' "$key" "$value" >>"${backup}/sysctl.tsv"
+    fi
   done
   ln -sfn "$backup" "$LATEST_BACKUP"
   printf '%s\n' "$backup"
@@ -694,10 +850,10 @@ restore_qdisc() {
     mq)
       tc qdisc replace dev "$iface" root mq 2>/dev/null || return 0
       while read -r leaf parent; do
-        case "$leaf" in fq|fq_codel|pfifo_fast|sfq) tc qdisc replace dev "$iface" parent "$parent" "$leaf" 2>/dev/null || true ;; esac
+        case "$leaf" in fq|fq_codel|pfifo_fast|sfq|cake) tc qdisc replace dev "$iface" parent "$parent" "$leaf" 2>/dev/null || true ;; esac
       done < <(awk '{kind=$2; parent=""; for(i=1;i<=NF;i++) if($i=="parent")parent=$(i+1); if(parent~/^:/)print kind,parent}' "${backup}/qdisc.txt")
       ;;
-    fq|fq_codel|sfq) tc qdisc replace dev "$iface" root "$kind" 2>/dev/null || true ;;
+    fq|fq_codel|sfq|cake) tc qdisc replace dev "$iface" root "$kind" 2>/dev/null || true ;;
     *) warn "原 qdisc ${kind} 无法完整自动重建，请参考 ${backup}/qdisc.txt" ;;
   esac
 }
@@ -854,7 +1010,7 @@ rollback_command() {
 }
 
 capture_state() {
-  local iface="$1" file="$2"
+  local iface="$1" file="$2" key
   {
     printf 'time=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'kernel=%s\n' "$(uname -srmo)"
@@ -865,10 +1021,13 @@ capture_state() {
     printf 'memory_tcp_budget_mib=%s\n' "$MEM_TCP_BUDGET_MIB"
     printf 'memory_buffer_cap_mib=%s\n' "$MEM_BUFFER_CAP_MIB"
     printf 'tcp_mem_pages=%s %s %s\n' "$TCP_MEM_LOW_PAGES" "$TCP_MEM_PRESSURE_PAGES" "$TCP_MEM_HIGH_PAGES"
-    for key in net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control net.core.default_qdisc \
-      net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem \
-      net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_window_scaling; do
-      printf '%s=%s\n' "$key" "$(sysctl_get "$key")"
+    printf '%s=%s\n' net.ipv4.tcp_available_congestion_control "$(sysctl_get net.ipv4.tcp_available_congestion_control)"
+    for key in "${TUNING_SYSCTL_KEYS[@]}"; do
+      if sysctl_exists "$key"; then
+        printf '%s=%s\n' "$key" "$(sysctl_get "$key")"
+      else
+        printf '%s=%s\n' "$key" "<unsupported>"
+      fi
     done
     printf '\n[qdisc]\n'
     tc -s -d qdisc show dev "$iface" 2>&1 || true
@@ -1056,16 +1215,18 @@ record_pair_result() {
     "$PAIR_MULTI_PASS" "$PAIR_SCORE" "$PAIR_ELIGIBLE" >>"$REPORT_FILE"
 }
 
-pair_better_than() {
-  local candidate="$1" current="$2"
-  [[ "$PAIR_ELIGIBLE" == "yes" ]] || return 1
-  awk -v a="$candidate" -v b="$current" 'BEGIN {exit !(a>b+0.25)}'
+candidate_better_than_best() {
+  [[ "$BEST_KIND" == "none" ]] && return 0
+  if [[ "$PAIR_ELIGIBLE" == "yes" && "$BEST_ELIGIBLE" != "yes" ]]; then return 0; fi
+  if [[ "$PAIR_ELIGIBLE" != "yes" && "$BEST_ELIGIBLE" == "yes" ]]; then return 1; fi
+  awk -v a="$PAIR_SCORE" -v b="$BEST_SCORE" 'BEGIN {exit !(a>b+0.25)}'
 }
 
-pair_regressed() {
-  local candidate="$1" current="$2"
-  [[ "$PAIR_ELIGIBLE" == "yes" ]] || return 0
-  awk -v a="$candidate" -v b="$current" 'BEGIN {exit !(a<b-0.75)}'
+candidate_regressed_from_best() {
+  [[ "$BEST_KIND" == "none" ]] && return 1
+  if [[ "$BEST_ELIGIBLE" == "yes" && "$PAIR_ELIGIBLE" != "yes" ]]; then return 0; fi
+  if [[ "$BEST_ELIGIBLE" != "yes" && "$PAIR_ELIGIBLE" == "yes" ]]; then return 1; fi
+  awk -v a="$PAIR_SCORE" -v b="$BEST_SCORE" 'BEGIN {exit !(a<b-0.75)}'
 }
 
 set_best_from_pair() {
@@ -1077,17 +1238,7 @@ set_best_from_pair() {
   BEST_MULTI_MBPS="$PAIR_MULTI_MBPS"
   BEST_MULTI_RETRANS_PERCENT="$PAIR_MULTI_RETRANS_PERCENT"
   BEST_SCORE="$PAIR_SCORE"
-}
-
-set_best_from_baseline() {
-  BEST_KIND="baseline"
-  BEST_BUFFER_MIB="$(awk -v b="$BASELINE_BUFFER_BYTES" 'BEGIN {printf "%.2f",b/1048576}')"
-  BEST_FACTOR="原配置"
-  BEST_SINGLE_MBPS="$BASELINE_SINGLE_MBPS"
-  BEST_SINGLE_RETRANS_PERCENT="$BASELINE_SINGLE_RETRANS_PERCENT"
-  BEST_MULTI_MBPS="$BASELINE_MULTI_MBPS"
-  BEST_MULTI_RETRANS_PERCENT="$BASELINE_MULTI_RETRANS_PERCENT"
-  BEST_SCORE="$BASELINE_SCORE"
+  BEST_ELIGIBLE="$PAIR_ELIGIBLE"
 }
 
 set_final_from_pair() {
@@ -1296,6 +1447,29 @@ stop_tuning_on_signal() {
   exit 130
 }
 
+backup_sysctl_value() {
+  local key="$1" file="${BACKUP_DIR}/sysctl.tsv"
+  [[ -r "$file" ]] || { printf '%s\n' '<未记录>'; return; }
+  awk -F '\t' -v wanted="$key" '$1==wanted {sub(/^[^\t]*\t/,""); print; found=1; exit} END {if(!found) print "<内核不支持>"}' "$file"
+}
+
+write_sysctl_comparison() {
+  local output="${SESSION_DIR}/sysctl-comparison.tsv" key before after status
+  printf 'parameter\tbefore\tafter\tstatus\n' >"$output"
+  printf '\n[7] 扩展系统与 TCP 参数明细\n' >>"$COMPARISON_FILE"
+  printf '%s\n' '----------------------------------------------------------------' >>"$COMPARISON_FILE"
+  printf '  %-43s | %-28s | %-28s | %s\n' '参数' '调优前' '调优后' '状态' >>"$COMPARISON_FILE"
+  printf '  %s\n' '--------------------------------------------+------------------------------+------------------------------+--------' >>"$COMPARISON_FILE"
+  for key in "${TUNING_SYSCTL_KEYS[@]}"; do
+    before="$(backup_sysctl_value "$key")"
+    if sysctl_exists "$key"; then after="$(sysctl_get "$key")"; else after="<内核不支持>"; fi
+    before="${before//$'\t'/ }"; after="${after//$'\t'/ }"
+    if [[ "$before" == "$after" ]]; then status="保持"; elif [[ "$after" == "<内核不支持>" ]]; then status="跳过"; else status="已调整"; fi
+    printf '%s\t%s\t%s\t%s\n' "$key" "$before" "$after" "$status" >>"$output"
+    printf '  %-43s | %-28s | %-28s | %s\n' "$key" "$before" "$after" "$status" >>"$COMPARISON_FILE"
+  done
+}
+
 write_comparison() {
   local iface="$1" final_buffer="$2"
   local single_delta multi_delta single_retrans_delta multi_retrans_delta score_delta
@@ -1311,10 +1485,10 @@ write_comparison() {
   after_wmem="$(sysctl_get net.ipv4.tcp_wmem)"
   after_tcp_mem="$(sysctl_get net.ipv4.tcp_mem)"
   case "$OUTCOME" in
-    optimized-runtime) disposition="已通过联合性能复核，优化参数当前在运行时生效，等待管理员确认" ;;
-    optimized-persistent) disposition="已通过联合性能复核，优化参数已应用并写入持久化配置" ;;
-    baseline-retained) disposition="候选参数未形成满足保护条件的综合收益，维持原始配置" ;;
-    baseline-restored-after-confirmation) disposition="候选参数最终复核未通过，已恢复原始配置" ;;
+    optimized-runtime) disposition="实测最优候选已满足联合目标，当前在运行时生效，等待管理员确认" ;;
+    optimized-persistent) disposition="实测最优候选已满足联合目标，并已写入持久化配置" ;;
+    best-effort-runtime) disposition="绝对目标未完全满足；已采用本次会话中单/多连接综合表现最优的候选，等待管理员确认" ;;
+    best-effort-persistent) disposition="绝对目标未完全满足；已采用本次会话中单/多连接综合表现最优的候选，并写入持久化配置" ;;
     *) disposition="$OUTCOME" ;;
   esac
   if (( OVERSHOOT_DETECTED )); then
@@ -1322,10 +1496,12 @@ write_comparison() {
   else
     boundary="在允许的缓存范围内未检测到明确回落，搜索终止于技术上限"
   fi
-  if [[ "$FINAL_PASS" == "yes" ]]; then
+  if [[ "$FINAL_PASS" == "yes" && "$PAIR_ELIGIBLE" == "yes" ]]; then
     assessment="单连接、多连接吞吐及重传指标均满足设定门槛"
+  elif [[ "$PAIR_ELIGIBLE" == "yes" ]]; then
+    assessment="候选保持了单连接与多连接基线能力，但至少一项绝对性能指标未达到设定门槛；报告按最佳努力结果归档"
   else
-    assessment="最终配置满足基线保护条件，但至少一项绝对性能指标未达到设定门槛"
+    assessment="没有候选同时满足全部保护线与绝对门槛；已按保护候选优先、均衡评分次序采用实测综合最优参数"
   fi
 
   cat >"$COMPARISON_FILE" <<EOF_COMPARE
@@ -1349,8 +1525,8 @@ TCP/BBR 参数优化评估报告
 测试方向：远程服务器 → 本地电脑（iperf3 反向测试）
 联合模型：单连接与 ${BALANCE_MULTI_STREAMS} 连接场景等权评估，使用调和均值抑制单侧性能偏科
 保护条件：单连接和多连接吞吐均不得低于对应基线的 ${BALANCE_MIN_RETENTION_PERCENT}%
-选择原则：在满足保护条件的候选中，选择综合评分最高的配置
-最终复核：最优候选重新执行单连接与多连接测试；复核退化时恢复原始配置
+选择原则：优先选择满足单/多连接保护线的候选，再按综合评分排序；未达到绝对目标时仍采用实测最优候选
+最终复核：最优候选重新执行单连接与多连接测试；仅测试失败、参数应用失败或异常中断时执行安全回滚
 
 [3] 测试环境
 ----------------------------------------------------------------
@@ -1373,6 +1549,8 @@ TCP 聚合内存预算：$(format_mib "$MEM_TCP_BUDGET_MIB")（有效总内存�
 单 socket 缓存搜索上限：$(format_mib "$MEM_BUFFER_CAP_MIB")
 链路 BDP：${BDP_MIB} MiB
 TCP 内存页阈值：${TCP_MEM_LOW_PAGES} / ${TCP_MEM_PRESSURE_PAGES} / ${TCP_MEM_HIGH_PAGES}
+vm.min_free_kbytes：${VM_MIN_FREE_KBYTES} KiB（有效总内存 1%，限制在 8～256 MiB）
+目标队列调度器：${TUNING_QDISC}（优先 CAKE，不支持时自动使用 fq）
 
 [5] 性能对比
 ----------------------------------------------------------------
@@ -1431,18 +1609,24 @@ tcp_mem
   - 调优前：${BEFORE_TCP_MEM}
   - 调优后：${after_tcp_mem}
 
-[7] 最优候选
+EOF_COMPARE
+
+  write_sysctl_comparison
+
+  cat >>"$COMPARISON_FILE" <<EOF_COMPARE
+[8] 最优候选
 ----------------------------------------------------------------
 候选标识：${BEST_KIND}
 缓存上限：${BEST_BUFFER_MIB} MiB
 缓存 / BDP：${BEST_FACTOR} 倍
 单连接吞吐：${BEST_SINGLE_MBPS} Mbps
 多连接吞吐：${BEST_MULTI_MBPS} Mbps
+基线保护状态：$([[ "$BEST_ELIGIBLE" == "yes" ]] && echo "通过" || echo "未通过（作为最佳努力候选采用）")
 单连接与多连接差异特征：$([[ "$QOS_DETECTED" == "1" ]] && echo "显著" || echo "不显著")
 EOF_COMPARE
 
   {
-    printf '\n[8] 逐轮测试明细\n'
+    printf '\n[9] 逐轮测试明细\n'
     printf '%s\n' '----------------------------------------------------------------'
     awk -F '\t' '
       function stage_name(value) {
@@ -1492,12 +1676,13 @@ EOF_COMPARE
       }
       END { emit_pair() }
     ' "$REPORT_FILE"
-    printf '[9] 审计文件\n'
+    printf '[10] 审计文件\n'
     printf '%s\n' '----------------------------------------------------------------'
     printf '完整运行日志：\n  %s\n' "$RUN_LOG"
     printf '结构化逐轮数据：\n  %s\n' "$REPORT_FILE"
     printf '调优前系统状态：\n  %s/system-before.txt\n' "$SESSION_DIR"
     printf '调优后系统状态：\n  %s/system-after.txt\n' "$SESSION_DIR"
+    printf '完整参数对比数据：\n  %s/sysctl-comparison.tsv\n' "$SESSION_DIR"
   } >>"$COMPARISON_FILE"
   cat "$COMPARISON_FILE"
 }
@@ -1546,7 +1731,7 @@ autotune() {
 
   RTT_MS=""; RTT_SOURCE=""
   SEARCH_ROUNDS=0; OVERSHOOT_DETECTED=0; OVERSHOOT_MIB=0
-  BEST_KIND="baseline"; BEST_BUFFER_MIB=0; BEST_FACTOR="原配置"; QOS_DETECTED=0
+  BEST_KIND="none"; BEST_BUFFER_MIB=0; BEST_FACTOR="未选择"; BEST_SCORE="-999999"; BEST_ELIGIBLE="no"; QOS_DETECTED=0
 
   detect_memory_limits
   ensure_bbr
@@ -1575,6 +1760,8 @@ autotune() {
   printf '  随机测试端口：%s（%s）\n' "$TEST_PORT" "$([[ "$IPERF_FAMILY" == "-6" ]] && echo IPv6 || echo IPv4)"
   printf '  TCP 聚合内存预算：%s（有效总内存的 2/3）\n' "$(format_mib "$MEM_TCP_BUDGET_MIB")"
   printf '  单 socket 缓存搜索上限：%s\n' "$(format_mib "$MEM_BUFFER_CAP_MIB")"
+  printf '  系统增强配置：BBR + %s，含 TCP 队列、端口、PMTU、邻居表及专用代理内存策略\n' "$TUNING_QDISC"
+  printf '  vm.min_free_kbytes：%s KiB（按有效总内存动态计算）\n' "$VM_MIN_FREE_KBYTES"
   printf '  连接等待 / 安全回滚：%s 秒 / %s 秒\n' "$WAIT_SECONDS" "$AUTO_ROLLBACK_SECONDS"
   printf '  日志目录：%s\n\n' "$SESSION_DIR"
   warn "请确认云安全组和服务器防火墙允许 TCP ${TEST_PORT}；本工具不会修改本地电脑"
@@ -1595,7 +1782,6 @@ autotune() {
   BASELINE_MULTI_PASS="$PAIR_MULTI_PASS"
   BASELINE_SCORE="$PAIR_SCORE"
   BASELINE_PASS="$PAIR_PASS"
-  set_best_from_baseline
 
   calculate_bdp
   generate_candidates
@@ -1627,11 +1813,11 @@ autotune() {
     printf '\n[SEARCH] 第 %-3s 轮｜倍增探索｜缓存 %6s MiB｜约 %5s × BDP\n' "$SEARCH_ROUNDS" "$mib" "$factor"
     apply_candidate "$iface" "$mib"
     run_balanced_pair "candidate-${SEARCH_ROUNDS}-${mib}m" "$address" "候选 ${SEARCH_ROUNDS}（倍增探索）" yes
-    record_pair_result candidate bbr-fq "$mib" "$factor"
-    if pair_better_than "$PAIR_SCORE" "$BEST_SCORE"; then
+    record_pair_result candidate "bbr-${TUNING_QDISC}" "$mib" "$factor"
+    if candidate_better_than_best; then
       set_best_from_pair "candidate-${SEARCH_ROUNDS}" "$mib" "$factor"
       info "均衡最优值更新：缓存 ${mib} MiB｜单连接 ${BEST_SINGLE_MBPS} Mbps｜多连接 ${BEST_MULTI_MBPS} Mbps｜评分 ${BEST_SCORE}"
-    elif [[ "$BEST_KIND" != "baseline" ]] && (( mib > BEST_BUFFER_MIB )) && pair_regressed "$PAIR_SCORE" "$BEST_SCORE"; then
+    elif (( mib > BEST_BUFFER_MIB )) && candidate_regressed_from_best; then
       OVERSHOOT_DETECTED=1
       OVERSHOOT_MIB="$mib"
       warn "候选 ${mib} MiB 已触及均衡性能边界，开始区间回退评估"
@@ -1643,7 +1829,7 @@ autotune() {
     fi
   done
 
-  if (( OVERSHOOT_DETECTED )) && [[ "$BEST_KIND" != "baseline" ]]; then
+  if (( OVERSHOOT_DETECTED )) && [[ "$BEST_KIND" != "none" ]]; then
     lower="${BEST_BUFFER_MIB%.*}"
     upper="$OVERSHOOT_MIB"
     section "第二阶段：在 ${lower}～${upper} MiB 区间内回退精调"
@@ -1654,12 +1840,12 @@ autotune() {
       printf '\n[SEARCH] 第 %-3s 轮｜区间精调｜缓存 %6s MiB｜约 %5s × BDP\n' "$SEARCH_ROUNDS" "$midpoint" "$factor"
       apply_candidate "$iface" "$midpoint"
       run_balanced_pair "candidate-${SEARCH_ROUNDS}-${midpoint}m" "$address" "候选 ${SEARCH_ROUNDS}（区间精调）" yes
-      record_pair_result candidate bbr-fq "$midpoint" "$factor"
-      if pair_better_than "$PAIR_SCORE" "$BEST_SCORE"; then
+      record_pair_result candidate "bbr-${TUNING_QDISC}" "$midpoint" "$factor"
+      if candidate_better_than_best; then
         set_best_from_pair "candidate-${SEARCH_ROUNDS}" "$midpoint" "$factor"
         lower="$midpoint"
         info "区间精调发现更优均衡点：${midpoint} MiB｜评分 ${BEST_SCORE}"
-      elif pair_regressed "$PAIR_SCORE" "$BEST_SCORE"; then
+      elif candidate_regressed_from_best; then
         upper="$midpoint"
         info "${midpoint} MiB 位于性能边界外侧，缩小上界"
       else
@@ -1670,47 +1856,40 @@ autotune() {
     info "区间精调已收敛至 ${lower}～${upper} MiB；选定实测均衡评分最高的 ${BEST_BUFFER_MIB} MiB"
   fi
 
-  if [[ "$BEST_KIND" == "baseline" ]]; then
-    info "候选参数未形成满足保护条件的综合增益，恢复并保留调优前配置"
+  if [[ "$BEST_KIND" == "none" ]]; then
     cancel_rollback_for_backup "$BACKUP_DIR"
     restore_backup "$BACKUP_DIR"
     TUNING_ACTIVE="0"
-    OUTCOME="baseline-retained"
-    set_final_from_baseline
-    FINAL_BUFFER_BYTES="$BASELINE_BUFFER_BYTES"
     trap - INT TERM
-  else
-    section "最终复核：应用均衡最优缓存 ${BEST_BUFFER_MIB} MiB"
-    apply_candidate "$iface" "$BEST_BUFFER_MIB"
-    run_balanced_pair "final-${BEST_BUFFER_MIB}m" "$address" "最优参数复核" yes
-    record_pair_result final bbr-fq "$BEST_BUFFER_MIB" "$BEST_FACTOR"
-    set_final_from_pair
-    FINAL_BUFFER_BYTES=$(( BEST_BUFFER_MIB * 1048576 ))
+    die "未取得任何有效候选测试结果，已恢复调优前配置"
+  fi
 
-    if [[ "$PAIR_ELIGIBLE" != "yes" ]] || awk -v f="$FINAL_SCORE" -v b="$BASELINE_SCORE" 'BEGIN {exit !(f<b-0.75)}'; then
-      warn "最终复核未满足单/多连接保护条件或综合评分低于基线，恢复原配置"
-      cancel_rollback_for_backup "$BACKUP_DIR"
-      restore_backup "$BACKUP_DIR"
-      TUNING_ACTIVE="0"
-      OUTCOME="baseline-restored-after-confirmation"
-      set_final_from_baseline
-      FINAL_BUFFER_BYTES="$BASELINE_BUFFER_BYTES"
-      set_best_from_baseline
-      trap - INT TERM
+  section "最终复核：应用实测最优缓存 ${BEST_BUFFER_MIB} MiB"
+  apply_candidate "$iface" "$BEST_BUFFER_MIB"
+  run_balanced_pair "final-${BEST_BUFFER_MIB}m" "$address" "最优参数复核" yes
+  record_pair_result final "bbr-${TUNING_QDISC}" "$BEST_BUFFER_MIB" "$BEST_FACTOR"
+  set_final_from_pair
+  FINAL_BUFFER_BYTES=$(( BEST_BUFFER_MIB * 1048576 ))
+
+  if [[ "$FINAL_PASS" == "yes" && "$PAIR_ELIGIBLE" == "yes" ]]; then
+    OUTCOME="optimized-runtime"
+  else
+    OUTCOME="best-effort-runtime"
+  fi
+  if (( PERSIST_FINAL )); then
+    info "实测最优候选复核完成，写入持久化配置"
+    write_persistent_config "$iface" "$BEST_BUFFER_MIB"
+    if [[ "$OUTCOME" == "optimized-runtime" ]]; then
+      OUTCOME="optimized-persistent"
     else
-      OUTCOME="optimized-runtime"
-      if (( PERSIST_FINAL )); then
-        info "最终复核通过，写入持久化配置"
-        write_persistent_config "$iface" "$BEST_BUFFER_MIB"
-        OUTCOME="optimized-persistent"
-      fi
-      trap - INT TERM
-      if (( AUTO_ROLLBACK_SECONDS > 0 )); then
-        warn "优化参数已生效；请在 ${AUTO_ROLLBACK_SECONDS} 秒内通过独立 SSH 会话验证，然后执行 sudo $PROGRAM confirm"
-      else
-        warn "优化参数已生效；本次运行未启用定时安全回滚"
-      fi
+      OUTCOME="best-effort-persistent"
     fi
+  fi
+  trap - INT TERM
+  if (( AUTO_ROLLBACK_SECONDS > 0 )); then
+    warn "实测最优参数已生效；请在 ${AUTO_ROLLBACK_SECONDS} 秒内通过独立 SSH 会话验证，然后执行 sudo $PROGRAM confirm"
+  else
+    warn "实测最优参数已生效；本次运行未启用定时安全回滚"
   fi
 
   capture_state "$iface" "${SESSION_DIR}/system-after.txt"
@@ -1719,7 +1898,7 @@ autotune() {
   TUNING_ACTIVE="0"
   trap - EXIT
   if [[ "$FINAL_PASS" != "yes" ]]; then
-    warn "最终配置未同时达到单连接与多连接的目标门槛；已按均衡评分和基线保护条件选择最优方案"
+    warn "最终配置未同时达到全部绝对门槛；仍已按单连接/多连接均衡评分采用本次实测最优候选"
   fi
   if (( QOS_DETECTED )); then
     warn "单连接与多连接吞吐差异显著，链路可能存在单流 QoS 或单连接路径限制"
@@ -1747,6 +1926,7 @@ status_command() {
   printf '  有效总内存：%s\n' "$(format_mib "$MEM_EFFECTIVE_MIB")"
   printf '  TCP 聚合内存预算：%s（有效总内存的 2/3）\n' "$(format_mib "$MEM_TCP_BUDGET_MIB")"
   printf '  单 socket 缓存上限：%s\n' "$(format_mib "$MEM_BUFFER_CAP_MIB")"
+  printf '  vm.min_free_kbytes 规划值：%s KiB\n' "$VM_MIN_FREE_KBYTES"
   printf '  接收缓存硬上限：%s\n' "$(format_bytes_mib "$rmax")"
   printf '  发送缓存硬上限：%s\n' "$(format_bytes_mib "$wmax")"
   printf '  tcp_rmem（最小/默认/最大）：%s\n' "$(sysctl_get net.ipv4.tcp_rmem)"

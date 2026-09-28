@@ -92,15 +92,20 @@ PAIR_SINGLE_MBPS="1000"; PAIR_MULTI_MBPS="200"
 calculate_pair_quality no
 biased_score="$PAIR_SCORE"
 awk -v balanced="$balanced_score" -v biased="$biased_score" 'BEGIN {exit !(balanced>biased)}' || fail "harmonic score must penalize one-sided performance"
-PAIR_ELIGIBLE="yes"
-pair_better_than 61 60 || fail "balanced score improvement"
-if pair_better_than 60.1 60; then fail "minor score noise must not replace the best candidate"; fi
-PAIR_ELIGIBLE="no"
-if pair_better_than 70 60; then fail "ineligible candidate must not become best"; fi
-pair_regressed 70 60 || fail "ineligible candidate is outside the safe boundary"
-PAIR_ELIGIBLE="yes"
-pair_regressed 59 60 || fail "material balanced-score regression"
-if pair_regressed 59.5 60; then fail "minor balanced-score noise must not trigger rollback"; fi
+
+# Best-effort selection always keeps a measured candidate. Candidates that
+# preserve both baselines take precedence, then the harmonic score decides.
+BEST_KIND="none"; BEST_SCORE="-999999"; BEST_ELIGIBLE="no"
+PAIR_SCORE="55"; PAIR_ELIGIBLE="no"
+candidate_better_than_best || fail "first measured candidate must be selectable"
+PAIR_SINGLE_MBPS="300"; PAIR_SINGLE_RETRANS_PERCENT="0.1"
+PAIR_MULTI_MBPS="700"; PAIR_MULTI_RETRANS_PERCENT="0.1"
+set_best_from_pair candidate-1 32 1.5
+PAIR_SCORE="50"; PAIR_ELIGIBLE="yes"
+candidate_better_than_best || fail "baseline-safe candidate must outrank unsafe candidate"
+set_best_from_pair candidate-2 64 3.0
+PAIR_SCORE="80"; PAIR_ELIGIBLE="no"
+if candidate_better_than_best; then fail "unsafe candidate must not displace baseline-safe best"; fi
 
 assert_eq "$(detect_iperf_family 203.0.113.20)" "-4" "IPv4 iperf family"
 assert_eq "$(detect_iperf_family 2001:db8::20)" "-6" "IPv6 iperf family"
@@ -188,6 +193,7 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
     MEM_TOTAL_MIB=8192; MEM_AVAILABLE_MIB=4096; MEM_EFFECTIVE_MIB=8192
     MEM_TCP_BUDGET_MIB=5461; MEM_BUFFER_CAP_MIB=128; PAGE_SIZE_BYTES=4096
     TCP_MEM_LOW_PAGES=699050; TCP_MEM_PRESSURE_PAGES=1048576; TCP_MEM_HIGH_PAGES=1398101
+    VM_MIN_FREE_KBYTES=83886
   }
   current_buffer_max() { echo 16777216; }
   sysctl_get() {
@@ -227,7 +233,7 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   assert_eq "$BEST_BUFFER_MIB" "86" "best balanced buffer selection"
   assert_eq "$FINAL_SINGLE_MBPS" "315" "final single-connection verification"
   assert_eq "$FINAL_MULTI_MBPS" "958" "final multi-connection verification"
-  assert_eq "$OUTCOME" "optimized-runtime" "search outcome"
+  assert_eq "$OUTCOME" "best-effort-runtime" "best-effort search outcome"
   assert_eq "$QOS_DETECTED" "1" "single-versus-multi difference classification"
   assert_eq "$OVERSHOOT_DETECTED" "1" "overshoot detection"
   assert_eq "$SEARCH_ROUNDS" "9" "adaptive search rounds"
@@ -236,6 +242,7 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   [[ -s "$HISTORY_FILE" ]] || fail "simulated history log"
   grep -q $'single\tbbr-fq\t1\t86' "$REPORT_FILE" || fail "single-connection candidate log"
   grep -q $'multi\tbbr-fq\t8\t86' "$REPORT_FILE" || fail "multi-connection candidate log"
+  grep -Fq '绝对目标未完全满足；已采用本次会话中单/多连接综合表现最优的候选' "$COMPARISON_FILE" || fail "best-effort report conclusion"
 )
 
 printf 'All autotune logic tests passed.\n'
