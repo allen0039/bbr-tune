@@ -102,6 +102,42 @@ PAIR_ELIGIBLE="yes"
 pair_regressed 59 60 || fail "material balanced-score regression"
 if pair_regressed 59.5 60; then fail "minor balanced-score noise must not trigger rollback"; fi
 
+assert_eq "$(detect_iperf_family 203.0.113.20)" "-4" "IPv4 iperf family"
+assert_eq "$(detect_iperf_family 2001:db8::20)" "-6" "IPv6 iperf family"
+
+# A malformed TCP connection must not consume the one-shot iperf3 server.
+# The supervisor restarts the listener until a complete measurement exists.
+(
+  fake_bin="$(mktemp -d)"
+  trap 'rm -rf "$fake_bin"' EXIT
+  export IPERF_ATTEMPTS="${fake_bin}/attempts"
+  export IPERF_ARGS="${fake_bin}/args"
+  export IPERF_FIXTURE="${ROOT}/tests/fixtures/iperf3-reverse.json"
+  printf '0\n' >"$IPERF_ATTEMPTS"
+  cat >"${fake_bin}/iperf3" <<'FAKE_IPERF_SERVER'
+#!/usr/bin/env bash
+count="$(cat "$IPERF_ATTEMPTS")"
+count=$((count+1))
+printf '%s\n' "$count" >"$IPERF_ATTEMPTS"
+printf '%s\n' "$*" >>"$IPERF_ARGS"
+if (( count == 1 )); then
+  printf '{"start":{"connected":[]},"end":{},"error":"unable to receive cookie"}\n'
+else
+  cat "$IPERF_FIXTURE"
+fi
+FAKE_IPERF_SERVER
+  chmod +x "${fake_bin}/iperf3"
+  PATH="${fake_bin}:/usr/bin:/bin"
+  final_json="${fake_bin}/final.json"
+  final_err="${fake_bin}/final.err"
+  iperf_server_loop "$final_json" "$final_err" 34567 -4
+  assert_eq "$(cat "$IPERF_ATTEMPTS")" "2" "invalid connection listener restart"
+  grep -q -- '-4 -s -1 -J -p 34567' "$IPERF_ARGS" || fail "iperf server address-family arguments"
+  grep -q 'ignored_connection=1' "$final_err" || fail "ignored connection audit log"
+  parse_iperf_json "$final_json"
+  assert_eq "$RESULT_MBPS" "800.00" "supervised iperf result"
+)
+
 # Listener detection works with IPv4, IPv6 and wildcard addresses.
 (
   ss() {

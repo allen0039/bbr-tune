@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.3.0"
+VERSION="2.3.1"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -46,6 +46,7 @@ RUN_LOG=""
 REPORT_FILE=""
 COMPARISON_FILE=""
 TEST_PORT=""
+IPERF_FAMILY="-4"
 CURRENT_TEST_PID=""
 BACKUP_DIR=""
 TUNING_ACTIVE="0"
@@ -341,6 +342,21 @@ choose_random_port() {
     fi
   done
   return 1
+}
+
+detect_iperf_family() {
+  local address="$1"
+  if [[ "$address" == *:* ]]; then
+    printf '%s\n' '-6'
+  elif [[ "$address" =~ ^[0-9]+([.][0-9]+){3}$ ]]; then
+    printf '%s\n' '-4'
+  elif have getent && getent ahostsv4 "$address" >/dev/null 2>&1; then
+    printf '%s\n' '-4'
+  elif have getent && getent ahostsv6 "$address" >/dev/null 2>&1; then
+    printf '%s\n' '-6'
+  else
+    printf '%s\n' '-4'
+  fi
 }
 
 floor_pow2() {
@@ -1121,6 +1137,61 @@ average_rtt_samples() {
   awk 'NF && $1 ~ /^[0-9]+([.][0-9]+)?$/ {sum+=$1; n++} END {if(n) printf "%.2f",sum/n}' "$file"
 }
 
+iperf_result_is_valid() {
+  local file="$1"
+  parse_iperf_json "$file" || return 1
+  awk -v bytes="$RESULT_BYTES" -v mbps="$RESULT_MBPS" 'BEGIN {exit !(bytes>0 && mbps>=0)}'
+}
+
+iperf_server_loop() {
+  local final_json="$1" final_err="$2" port="$3" family="${4:--4}"
+  local attempt_json="${final_json}.attempt" attempt_err="${final_err}.attempt"
+  local server_pid="" rc=0 attempt=0
+
+  trap 'if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; exit 143' TERM INT
+  : >"$final_err"
+  while true; do
+    attempt=$((attempt+1))
+    : >"$attempt_json"
+    : >"$attempt_err"
+    iperf3 "$family" -s -1 -J -p "$port" >"$attempt_json" 2>"$attempt_err" &
+    server_pid=$!
+    set +e
+    wait "$server_pid"
+    rc=$?
+    set -e
+    server_pid=""
+
+    if iperf_result_is_valid "$attempt_json"; then
+      mv -f "$attempt_json" "$final_json"
+      [[ ! -s "$attempt_err" ]] || cat "$attempt_err" >>"$final_err"
+      rm -f "$attempt_err"
+      return 0
+    fi
+
+    {
+      printf '[%s] ignored_connection=%s server_exit=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$attempt" "$rc"
+      cat "$attempt_err"
+      cat "$attempt_json"
+      printf '\n'
+    } >>"$final_err"
+    warn "测试端口收到无效或不完整连接，iperf3 监听已自动恢复（第 ${attempt} 次）"
+    sleep 0.1
+  done
+}
+
+wait_for_iperf_listener() {
+  local port="$1" process_id="$2" attempt
+  for ((attempt=1; attempt<=100; attempt++)); do
+    kill -0 "$process_id" 2>/dev/null || return 1
+    if ! port_is_free "$port"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 run_reverse_test() {
   local label="$1" streams="$2" address="$3" display_label="${4:-$1}" json_file err_file rtt_file elapsed=0 limit rc sample fallback_addr fallback_rtt
   json_file="${SESSION_DIR}/${label}.json"
@@ -1128,15 +1199,23 @@ run_reverse_test() {
   rtt_file="${SESSION_DIR}/${label}.rtt-samples"
   port_is_free "$TEST_PORT" || die "测试端口 ${TEST_PORT} 已被占用"
   : >"$json_file"; : >"$err_file"; : >"$rtt_file"
-  iperf3 -s -1 -J -p "$TEST_PORT" >"$json_file" 2>"$err_file" &
+  iperf_server_loop "$json_file" "$err_file" "$TEST_PORT" "$IPERF_FAMILY" &
   CURRENT_TEST_PID=$!
-  sleep 1
-  kill -0 "$CURRENT_TEST_PID" 2>/dev/null || { cat "$err_file" >&2; die "iperf3 服务端启动失败"; }
+  if ! wait_for_iperf_listener "$TEST_PORT" "$CURRENT_TEST_PID"; then
+    kill "$CURRENT_TEST_PID" 2>/dev/null || true
+    wait "$CURRENT_TEST_PID" 2>/dev/null || true
+    CURRENT_TEST_PID=""
+    cat "$err_file" >&2 || true
+    die "iperf3 服务端未能在 TCP ${TEST_PORT} 建立监听"
+  fi
 
   section "${display_label}｜${streams} 个 TCP 流｜端口 ${TEST_PORT}"
+  printf '服务器监听状态：已确认 TCP %s 正在监听。\n' "$TEST_PORT"
   printf '本地只需执行下面一条命令（不会修改本地 TCP 参数）：\n\n'
-  printf '  iperf3 -c %s -p %s -R -P %s -t %s -i 1\n\n' "$address" "$TEST_PORT" "$streams" "$DURATION"
+  printf '  iperf3 %s -c %s -p %s -R -P %s -t %s -i 1\n\n' "$IPERF_FAMILY" "$address" "$TEST_PORT" "$streams" "$DURATION"
   printf '等待规则：最多等待连接 %s 秒；开始传输后约运行 %s 秒。\n' "$WAIT_SECONDS" "$DURATION"
+  printf '若端口被扫描或收到无效连接，服务器会自动恢复监听；请重新执行同一命令。\n'
+  printf '如仍提示连接被拒绝，请确认安全组和服务器防火墙允许 TCP %s。\n' "$TEST_PORT"
   limit=$(( WAIT_SECONDS + DURATION + 10 ))
   while kill -0 "$CURRENT_TEST_PID" 2>/dev/null; do
     sleep 1
@@ -1144,13 +1223,20 @@ run_reverse_test() {
     sample="$(sample_tcp_rtt "$TEST_PORT" || true)"
     [[ -n "$sample" ]] && printf '%s\n' "$sample" >>"$rtt_file"
     if (( elapsed % 5 == 0 )); then
-      printf '[TEST ] 状态：等待连接或测试进行中｜已用 %3s 秒｜端口 %s\n' "$elapsed" "$TEST_PORT"
+      if port_is_free "$TEST_PORT"; then
+        printf '[TEST ] 状态：监听正在自动恢复｜已用 %3s 秒｜端口 %s\n' "$elapsed" "$TEST_PORT"
+      else
+        printf '[TEST ] 状态：等待连接或测试进行中｜已用 %3s 秒｜端口 %s｜监听正常\n' "$elapsed" "$TEST_PORT"
+      fi
+    fi
+    if (( elapsed == 15 )); then
+      printf '[CHECK] 若本地连接被拒绝，请核对服务器公网地址，并放行安全组/防火墙 TCP %s。\n' "$TEST_PORT"
     fi
     if (( elapsed >= limit )); then
       kill "$CURRENT_TEST_PID" 2>/dev/null || true
       wait "$CURRENT_TEST_PID" 2>/dev/null || true
       CURRENT_TEST_PID=""
-      die "本轮测试超时：${WAIT_SECONDS} 秒内未连接，或测试未正常结束"
+      die "本轮测试超时：服务器监听已启动，但 ${WAIT_SECONDS} 秒内未收到有效测试；请检查公网地址、安全组和服务器防火墙 TCP ${TEST_PORT}"
     fi
   done
   set +e
@@ -1454,6 +1540,7 @@ autotune() {
   [[ -n "$address" ]] || die "无法识别服务器连接地址，请使用 --server-address"
   SERVER_ADDRESS="$address"
   TEST_PORT="$(choose_random_port)" || die "无法找到未占用的随机端口"
+  IPERF_FAMILY="$(detect_iperf_family "$address")"
   BALANCE_MULTI_STREAMS="$START_STREAMS"
   (( BALANCE_MULTI_STREAMS < 2 )) && BALANCE_MULTI_STREAMS=8
 
@@ -1485,7 +1572,7 @@ autotune() {
   printf '  评估模型：单连接与 %s 连接分别测试，采用均衡评分联合选优\n' "$BALANCE_MULTI_STREAMS"
   printf '  单项保护线：候选的单连接及多连接吞吐均不得低于各自基线的 %s%%\n' "$BALANCE_MIN_RETENTION_PERCENT"
   printf '  RTT：首轮 TCP 测试自动测量\n'
-  printf '  随机测试端口：%s\n' "$TEST_PORT"
+  printf '  随机测试端口：%s（%s）\n' "$TEST_PORT" "$([[ "$IPERF_FAMILY" == "-6" ]] && echo IPv6 || echo IPv4)"
   printf '  TCP 聚合内存预算：%s（有效总内存的 2/3）\n' "$(format_mib "$MEM_TCP_BUDGET_MIB")"
   printf '  单 socket 缓存搜索上限：%s\n' "$(format_mib "$MEM_BUFFER_CAP_MIB")"
   printf '  连接等待 / 安全回滚：%s 秒 / %s 秒\n' "$WAIT_SECONDS" "$AUTO_ROLLBACK_SECONDS"
