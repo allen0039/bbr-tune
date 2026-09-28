@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -25,14 +25,15 @@ IFACE="auto"
 SERVER_ADDRESS=""
 TARGET_MBPS=""
 RTT_MS=""
+RTT_SOURCE=""
 START_STREAMS="1"
 TEST_STREAMS="1"
 DURATION="15"
 WAIT_SECONDS="300"
-MAX_CANDIDATES="4"
 TARGET_UTILIZATION="90"
 MAX_RETRANS_PERCENT="1"
 AUTO_ROLLBACK_SECONDS="3600"
+TCP_BUFFER_ABSOLUTE_MAX_MIB="1024"
 PERSIST_FINAL="0"
 FORCE="0"
 YES="0"
@@ -60,6 +61,9 @@ RESULT_MBPS="0"
 RESULT_BYTES="0"
 RESULT_RETRANS="0"
 RESULT_RETRANS_PERCENT="100"
+RESULT_RTT_MS="0"
+RESULT_RTT_SOURCE=""
+RESULT_CLIENT_ADDRESS=""
 RESULT_SCORE="-999999"
 RESULT_PASS="no"
 
@@ -98,6 +102,9 @@ BEFORE_BUFFER_BYTES="0"
 
 CANDIDATE_MIBS=()
 CANDIDATE_FACTORS=()
+SEARCH_ROUNDS="0"
+OVERSHOOT_DETECTED="0"
+OVERSHOOT_MIB="0"
 
 log_line() {
   local level="$1"; shift
@@ -110,9 +117,9 @@ error() { log_line ERROR "$*" >&2; }
 die() { error "$*"; exit 1; }
 
 section() {
-  printf '\n┌──────────────────────────────────────────────────────────────┐\n'
-  printf '│ %-60s │\n' "$*"
-  printf '└──────────────────────────────────────────────────────────────┘\n'
+  printf '\n┌──────────────────────────────────────────────────────────────\n'
+  printf '│ %s\n' "$*"
+  printf '└──────────────────────────────────────────────────────────────\n'
 }
 
 usage() {
@@ -128,30 +135,28 @@ usage() {
   sudo ./bbr-tune.sh rollback [--backup DIR] 恢复调优前参数
 
 自动寻优参数：
-  --bandwidth-mbps N       目标带宽，单位 Mbps，必填
-  --rtt-ms N               本地到服务器 RTT，单位 ms，必填
+  --bandwidth-mbps N       期望的端到端下载带宽，单位 Mbps，必填
+                           方向为“远程服务器 → 本地电脑”；通常填写
+                           服务器出站上限与本地下载上限中的较小值
   --server-address HOST    本地 iperf3 应连接的服务器地址
   --iface auto|DEV         出口网卡，默认自动识别
   --parallel N             起始并发流数，默认 1；必要时自动测试 8/16 流
   --duration N             每轮测试时长，默认 15 秒
-  --wait-seconds N         每轮等待本地连接的时间，默认 300 秒
-  --max-candidates N       最多测试的 TCP 缓冲候选数，默认 4
   --target-utilization N   达标吞吐百分比，默认 90
   --max-retrans-percent N  最大估算重传比例，默认 1
-  --auto-rollback-seconds N 安全回滚时间，默认 3600 秒
-  --persist                最优参数确认后写入持久化配置
+  --persist                最优参数复测后写入开机配置
   --force                  允许覆盖无法完整恢复的自定义 root qdisc
 
-工作方式：
-  1. 脚本始终运行在远程 Linux 服务器。
-  2. 本地电脑只执行屏幕显示的 iperf3 -c ... -R 命令。
-  3. 先测试调优前性能，再按服务器内存与 BDP 生成候选参数。
-  4. 对候选参数逐一测试，出现性能平台后停止，复测最优候选。
-  5. 如果最优候选不如原配置，自动恢复原配置。
-  6. 所有结果和原始 JSON 长期保存在 /var/lib/bbr-tcp-tuning/sessions。
+自动测试规则：
+  1. 脚本只在远程 Linux 服务器修改 TCP/BBR 参数。
+  2. 本地电脑只运行屏幕显示的 iperf3 客户端命令，不改任何本地参数。
+  3. 首轮反向 iperf3 会自动测量本地与服务器之间的 TCP RTT，无需填写 RTT。
+  4. TCP 缓存预算仅按服务器总内存（含 cgroup 总上限）分档计算，不使用可用内存决定上限。
+  5. 候选数量不设人工上限：先持续增大缓存；发现性能越界后回退并二分精调。
+  6. 每轮固定等待本地连接 300 秒；修改后固定保留 3600 秒安全回滚窗口。
+  7. 所有结果和原始 JSON 长期保存在 /var/lib/bbr-tcp-tuning/sessions。
 USAGE
 }
-
 is_integer() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 is_number() { [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -177,16 +182,12 @@ parse_args() {
   while (( $# )); do
     case "$1" in
       --bandwidth-mbps) need_value "$@"; TARGET_MBPS="$2"; shift 2 ;;
-      --rtt-ms) need_value "$@"; RTT_MS="$2"; shift 2 ;;
       --server-address) need_value "$@"; SERVER_ADDRESS="$2"; shift 2 ;;
       --iface) need_value "$@"; IFACE="$2"; shift 2 ;;
       --parallel) need_value "$@"; START_STREAMS="$2"; shift 2 ;;
       --duration) need_value "$@"; DURATION="$2"; shift 2 ;;
-      --wait-seconds) need_value "$@"; WAIT_SECONDS="$2"; shift 2 ;;
-      --max-candidates) need_value "$@"; MAX_CANDIDATES="$2"; shift 2 ;;
       --target-utilization) need_value "$@"; TARGET_UTILIZATION="$2"; shift 2 ;;
       --max-retrans-percent) need_value "$@"; MAX_RETRANS_PERCENT="$2"; shift 2 ;;
-      --auto-rollback-seconds) need_value "$@"; AUTO_ROLLBACK_SECONDS="$2"; shift 2 ;;
       --backup) need_value "$@"; BACKUP_PATH="$2"; shift 2 ;;
       --persist) PERSIST_FINAL="1"; shift ;;
       --force) FORCE="1"; shift ;;
@@ -199,28 +200,18 @@ parse_args() {
 }
 
 validate_autotune_options() {
-  [[ -n "$TARGET_MBPS" && -n "$RTT_MS" ]] || die "autotune 需要 --bandwidth-mbps 和 --rtt-ms"
+  [[ -n "$TARGET_MBPS" ]] || die "autotune 需要 --bandwidth-mbps"
   is_number "$TARGET_MBPS" || die "目标带宽必须是正数"
-  is_number "$RTT_MS" || die "RTT 必须是正数"
   is_integer "$START_STREAMS" || die "并发流数必须是整数"
   is_integer "$DURATION" || die "测试时长必须是整数"
-  is_integer "$WAIT_SECONDS" || die "等待时间必须是整数"
-  is_integer "$MAX_CANDIDATES" || die "候选数量必须是整数"
   is_number "$TARGET_UTILIZATION" || die "目标利用率必须是数字"
   is_number "$MAX_RETRANS_PERCENT" || die "重传比例必须是数字"
-  is_integer "$AUTO_ROLLBACK_SECONDS" || die "安全回滚时间必须是整数"
   awk -v v="$TARGET_MBPS" 'BEGIN {exit !(v>0)}' || die "目标带宽必须大于 0"
-  awk -v v="$RTT_MS" 'BEGIN {exit !(v>0)}' || die "RTT 必须大于 0"
   (( START_STREAMS >= 1 && START_STREAMS <= 64 )) || die "并发流数必须在 1~64"
   (( DURATION >= 5 && DURATION <= 300 )) || die "测试时长必须在 5~300 秒"
-  (( WAIT_SECONDS >= 30 && WAIT_SECONDS <= 3600 )) || die "等待时间必须在 30~3600 秒"
-  (( MAX_CANDIDATES >= 1 && MAX_CANDIDATES <= 6 )) || die "候选数量必须在 1~6"
   awk -v v="$TARGET_UTILIZATION" 'BEGIN {exit !(v>0 && v<=100)}' || die "目标利用率必须在 0~100"
   awk -v v="$MAX_RETRANS_PERCENT" 'BEGIN {exit !(v>=0 && v<=100)}' || die "重传比例必须在 0~100"
-  (( AUTO_ROLLBACK_SECONDS == 0 || (AUTO_ROLLBACK_SECONDS >= 300 && AUTO_ROLLBACK_SECONDS <= 86400) )) || \
-    die "安全回滚时间必须为 0，或在 300~86400 秒"
 }
-
 resolve_iface() {
   if [[ "$IFACE" != "auto" ]]; then
     printf '%s\n' "$IFACE"
@@ -237,6 +228,35 @@ guess_server_address() {
   else
     ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
   fi
+}
+
+guess_client_address() {
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    awk '{print $1}' <<<"$SSH_CONNECTION"
+  elif [[ -n "${SSH_CLIENT:-}" ]]; then
+    awk '{print $1}' <<<"$SSH_CLIENT"
+  fi
+}
+
+measure_ping_rtt() {
+  local address="$1" output value
+  [[ -n "$address" ]] && have ping || return 1
+  output="$(ping -n -c 5 -W 2 "$address" 2>/dev/null)" || return 1
+  value="$(awk -F= '/min\/avg\/max|round-trip/ {gsub(/[[:space:]]/,"",$2); split($2,a,"/"); print a[2]; exit}' <<<"$output")"
+  is_number "$value" || return 1
+  awk -v v="$value" 'BEGIN {printf "%.2f",v}'
+}
+
+format_bytes_mib() {
+  awk -v b="${1:-0}" 'BEGIN {printf "%d bytes (%.2f MiB)",b,b/1048576}'
+}
+
+format_mib() {
+  awk -v m="${1:-0}" 'BEGIN {printf "%.2f MiB",m}'
+}
+
+format_pass() {
+  [[ "$1" == "yes" ]] && printf '是' || printf '否'
 }
 
 sysctl_get() { sysctl -n "$1" 2>/dev/null || true; }
@@ -317,20 +337,16 @@ detect_memory_limits() {
     fi
   fi
 
-  calculate_memory_buffer_cap "$MEM_EFFECTIVE_MIB" "$MEM_AVAILABLE_MIB"
+  calculate_memory_buffer_cap "$MEM_EFFECTIVE_MIB"
 }
 
 calculate_memory_buffer_cap() {
-  local effective_mib="$1" available_mib="$2" by_total by_available cap
-  by_total=$(( effective_mib / 64 ))
-  by_available=$(( available_mib / 16 ))
-  (( by_total < 4 )) && by_total=4
-  (( by_available < 4 )) && by_available=4
-  cap="$by_total"
-  (( by_available < cap )) && cap="$by_available"
-  (( cap > 256 )) && cap=256
+  local total_mib="$1" cap
+  cap=$(( total_mib / 64 ))
+  (( cap < 4 )) && cap=4
+  (( cap > TCP_BUFFER_ABSOLUTE_MAX_MIB )) && cap="$TCP_BUFFER_ABSOLUTE_MAX_MIB"
   MEM_BUFFER_CAP_MIB="$(floor_pow2 "$cap")"
-  if (( MEM_BUFFER_CAP_MIB < 4 )); then MEM_BUFFER_CAP_MIB=4; fi
+  (( MEM_BUFFER_CAP_MIB < 4 )) && MEM_BUFFER_CAP_MIB=4
   return 0
 }
 
@@ -339,31 +355,35 @@ calculate_bdp() {
   BDP_MIB="$(awk -v b="$BDP_BYTES" 'BEGIN {printf "%.2f", b/1048576}')"
 }
 
+candidate_factor() {
+  local mib="$1"
+  awk -v bytes="$(( mib * 1048576 ))" -v bdp="$BDP_BYTES" 'BEGIN {if(bdp<=0) print "0.00"; else printf "%.2f",bytes/bdp}'
+}
+
 add_candidate() {
-  local mib="$1" factor="$2" existing
+  local mib="$1" existing
   for existing in "${CANDIDATE_MIBS[@]:-}"; do
     [[ "$existing" == "$mib" ]] && return 0
   done
   CANDIDATE_MIBS+=("$mib")
-  CANDIDATE_FACTORS+=("$factor")
+  CANDIDATE_FACTORS+=("$(candidate_factor "$mib")")
 }
 
 generate_candidates() {
-  local factor bytes need_mib rounded
+  local need_mib current
   CANDIDATE_MIBS=()
   CANDIDATE_FACTORS=()
-  for factor in 1.0 1.5 2.0 3.0 4.0; do
-    bytes="$(awk -v b="$BDP_BYTES" -v f="$factor" 'BEGIN {printf "%.0f", b*f}')"
-    need_mib="$(awk -v b="$bytes" 'BEGIN {printf "%.0f", (b+1048575)/1048576}')"
-    (( need_mib < 4 )) && need_mib=4
-    rounded="$(ceil_pow2 "$need_mib")"
-    (( rounded > MEM_BUFFER_CAP_MIB )) && rounded="$MEM_BUFFER_CAP_MIB"
-    add_candidate "$rounded" "$factor"
-    (( ${#CANDIDATE_MIBS[@]} >= MAX_CANDIDATES )) && break
+  need_mib="$(awk -v b="$BDP_BYTES" 'BEGIN {printf "%.0f", (b+1048575)/1048576}')"
+  (( need_mib < 4 )) && need_mib=4
+  current="$(ceil_pow2 "$need_mib")"
+  (( current > MEM_BUFFER_CAP_MIB )) && current="$MEM_BUFFER_CAP_MIB"
+  while true; do
+    add_candidate "$current"
+    (( current >= MEM_BUFFER_CAP_MIB )) && break
+    current=$(( current * 2 ))
+    (( current > MEM_BUFFER_CAP_MIB )) && current="$MEM_BUFFER_CAP_MIB"
   done
-  (( ${#CANDIDATE_MIBS[@]} > 0 )) || add_candidate "$MEM_BUFFER_CAP_MIB" "memory-cap"
 }
-
 current_buffer_max() {
   local core_r core_w tcp_r tcp_w tr tw max=0 n
   core_r="$(sysctl_get net.core.rmem_max)"
@@ -757,18 +777,27 @@ init_session() {
   COMPARISON_FILE="${SESSION_DIR}/comparison.txt"
   : >"$RUN_LOG"
   exec > >(tee -a "$RUN_LOG") 2>&1
-  printf 'stage\tconfig\tstreams\tbuffer_mib\tfactor\tmbps\tretrans\tretrans_percent\tscore\tpassed\n' >"$REPORT_FILE"
+  printf 'stage\tround\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tscore\tpassed\n' >"$REPORT_FILE"
 }
 
 parse_iperf_json() {
-  local file="$1" values bps bytes retrans
+  local file="$1" values bps bytes retrans rtt_us client
   if have python3; then
     values="$(python3 - "$file" <<'PY_JSON'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     data=json.load(fh)
-sent=data["end"]["sum_sent"]
-print(f'{sent.get("bits_per_second",0)}\t{sent.get("bytes",0)}\t{sent.get("retransmits",0)}')
+sent=data.get("end", {}).get("sum_sent", {})
+rtts=[]
+for stream in data.get("end", {}).get("streams", []):
+    sender=stream.get("sender", stream)
+    value=sender.get("mean_rtt")
+    if isinstance(value, (int, float)) and value > 0:
+        rtts.append(value)
+connected=data.get("start", {}).get("connected", [])
+client=connected[0].get("remote_host", "") if connected else ""
+rtt=sum(rtts)/len(rtts) if rtts else 0
+print(f'{sent.get("bits_per_second",0)}\t{sent.get("bytes",0)}\t{sent.get("retransmits",0)}\t{rtt}\t{client}')
 PY_JSON
 )" || return 1
   else
@@ -779,14 +808,37 @@ PY_JSON
       inside && /"retransmits"[[:space:]]*:/ {v=$0; sub(/^.*:[[:space:]]*/,"",v); sub(/,.*/,"",v); retrans=v}
       inside && /^[[:space:]]*}/ {if(bps!=""){if(bytes=="")bytes=0;if(retrans=="")retrans=0;print bps"\t"bytes"\t"retrans;exit}}
     ' "$file")"
+    rtt_us="$(awk '/"mean_rtt"[[:space:]]*:/ {v=$0; sub(/^.*:[[:space:]]*/,"",v); sub(/,.*/,"",v); if(v+0>0){sum+=v;n++}} END {if(n) printf "%.2f",sum/n; else print 0}' "$file")"
+    client="$(awk '/"remote_host"[[:space:]]*:/ {v=$0; sub(/^.*:[[:space:]]*"/,"",v); sub(/".*/,"",v); print v; exit}' "$file")"
+    values="${values}"$'\t'"${rtt_us}"$'\t'"${client}"
   fi
   [[ -n "$values" ]] || return 1
-  IFS=$'\t' read -r bps bytes retrans <<<"$values"
+  IFS=$'\t' read -r bps bytes retrans rtt_us client <<<"$values"
   is_number "$bps" && is_number "$bytes" && is_number "$retrans" || return 1
   RESULT_MBPS="$(awk -v v="$bps" 'BEGIN {printf "%.2f",v/1000000}')"
   RESULT_BYTES="$(awk -v v="$bytes" 'BEGIN {printf "%.0f",v}')"
   RESULT_RETRANS="$(awk -v v="$retrans" 'BEGIN {printf "%.0f",v}')"
   RESULT_RETRANS_PERCENT="$(awk -v r="$RESULT_RETRANS" -v b="$RESULT_BYTES" 'BEGIN {if(b<=0)print "100.0000";else printf "%.4f",r*1448/b*100}')"
+  if is_number "${rtt_us:-}" && awk -v v="$rtt_us" 'BEGIN {exit !(v>0)}'; then
+    RESULT_RTT_MS="$(awk -v v="$rtt_us" 'BEGIN {printf "%.2f",v/1000}')"
+    RESULT_RTT_SOURCE="iperf3 JSON"
+  else
+    RESULT_RTT_MS="0"
+    RESULT_RTT_SOURCE=""
+  fi
+  RESULT_CLIENT_ADDRESS="${client:-}"
+}
+
+adopt_measured_rtt() {
+  if is_number "$RESULT_RTT_MS" && awk -v v="$RESULT_RTT_MS" 'BEGIN {exit !(v>0)}'; then
+    RTT_MS="$RESULT_RTT_MS"
+    RTT_SOURCE="${RESULT_RTT_SOURCE:-TCP 实测}"
+  fi
+}
+
+candidate_regressed() {
+  local candidate="$1" reference="$2"
+  awk -v a="$candidate" -v b="$reference" 'BEGIN {exit !(a < b-0.50)}'
 }
 
 print_interval_log() {
@@ -843,33 +895,57 @@ next_stream_count() {
   if (( $1 < 8 )); then printf '8\n'; elif (( $1 < 16 )); then printf '16\n'; else printf '%s\n' "$1"; fi
 }
 
+sample_tcp_rtt() {
+  local port="$1"
+  ss -tin 2>/dev/null | awk -v needle=":${port}" '
+    index($0,needle) {matched=1; next}
+    matched && /rtt:/ {
+      v=$0
+      sub(/^.*rtt:/,"",v)
+      sub(/\/.*/,"",v)
+      gsub(/[[:space:]]/,"",v)
+      if(v ~ /^[0-9]+([.][0-9]+)?$/) print v
+      exit
+    }
+    matched && $0 !~ /^[[:space:]]/ {matched=0}
+  '
+}
+
+average_rtt_samples() {
+  local file="$1"
+  awk 'NF && $1 ~ /^[0-9]+([.][0-9]+)?$/ {sum+=$1; n++} END {if(n) printf "%.2f",sum/n}' "$file"
+}
+
 run_reverse_test() {
-  local label="$1" streams="$2" address="$3" json_file err_file elapsed=0 limit rc
+  local label="$1" streams="$2" address="$3" display_label="${4:-$1}" json_file err_file rtt_file elapsed=0 limit rc sample fallback_addr fallback_rtt
   json_file="${SESSION_DIR}/${label}.json"
   err_file="${SESSION_DIR}/${label}.err"
+  rtt_file="${SESSION_DIR}/${label}.rtt-samples"
   port_is_free "$TEST_PORT" || die "测试端口 ${TEST_PORT} 已被占用"
-  : >"$json_file"; : >"$err_file"
+  : >"$json_file"; : >"$err_file"; : >"$rtt_file"
   iperf3 -s -1 -J -p "$TEST_PORT" >"$json_file" 2>"$err_file" &
   CURRENT_TEST_PID=$!
   sleep 1
   kill -0 "$CURRENT_TEST_PID" 2>/dev/null || { cat "$err_file" >&2; die "iperf3 服务端启动失败"; }
 
-  section "测试 ${label}｜${streams} 流｜端口 ${TEST_PORT}"
-  printf '请在本地电脑执行：\n\n  iperf3 -c %s -p %s -R -P %s -t %s -i 1\n\n' \
-    "$address" "$TEST_PORT" "$streams" "$DURATION"
-  printf '服务器只接收测试结果，不会修改本地电脑。\n'
+  section "${display_label}｜${streams} 个 TCP 流｜端口 ${TEST_PORT}"
+  printf '本地只需执行下面一条命令（不会修改本地 TCP 参数）：\n\n'
+  printf '  iperf3 -c %s -p %s -R -P %s -t %s -i 1\n\n' "$address" "$TEST_PORT" "$streams" "$DURATION"
+  printf '等待规则：最多等待连接 %s 秒；开始传输后约运行 %s 秒。\n' "$WAIT_SECONDS" "$DURATION"
   limit=$(( WAIT_SECONDS + DURATION + 10 ))
   while kill -0 "$CURRENT_TEST_PID" 2>/dev/null; do
     sleep 1
     elapsed=$((elapsed+1))
+    sample="$(sample_tcp_rtt "$TEST_PORT" || true)"
+    [[ -n "$sample" ]] && printf '%s\n' "$sample" >>"$rtt_file"
     if (( elapsed % 5 == 0 )); then
-      printf '[TEST ] 已运行/等待 %3ss，服务端 PID=%s，端口=%s\n' "$elapsed" "$CURRENT_TEST_PID" "$TEST_PORT"
+      printf '[TEST ] 状态：等待连接或测试进行中｜已用 %3s 秒｜端口 %s\n' "$elapsed" "$TEST_PORT"
     fi
     if (( elapsed >= limit )); then
       kill "$CURRENT_TEST_PID" 2>/dev/null || true
       wait "$CURRENT_TEST_PID" 2>/dev/null || true
       CURRENT_TEST_PID=""
-      die "本轮测试超时"
+      die "本轮测试超时：${WAIT_SECONDS} 秒内未连接，或测试未正常结束"
     fi
   done
   set +e
@@ -878,17 +954,32 @@ run_reverse_test() {
   CURRENT_TEST_PID=""
   (( rc == 0 )) || { cat "$err_file" >&2 || true; die "iperf3 测试失败，退出码 ${rc}"; }
   parse_iperf_json "$json_file" || { cat "$json_file" >&2 || true; die "无法解析 iperf3 测试结果"; }
+  if ! awk -v v="$RESULT_RTT_MS" 'BEGIN {exit !(v>0)}'; then
+    RESULT_RTT_MS="$(average_rtt_samples "$rtt_file")"
+    if [[ -n "$RESULT_RTT_MS" ]]; then RESULT_RTT_SOURCE="ss TCP socket"; else RESULT_RTT_MS="0"; fi
+  fi
+  if ! awk -v v="$RESULT_RTT_MS" 'BEGIN {exit !(v>0)}'; then
+    fallback_addr="${RESULT_CLIENT_ADDRESS:-$(guess_client_address)}"
+    fallback_rtt="$(measure_ping_rtt "$fallback_addr" || true)"
+    if [[ -n "$fallback_rtt" ]]; then RESULT_RTT_MS="$fallback_rtt"; RESULT_RTT_SOURCE="ICMP ping 备用测量"; fi
+  fi
   calculate_result_quality
   print_interval_log "$json_file"
-  printf '[RESULT] %.2f Mbps｜Retr=%s｜估算重传=%s%%｜score=%s｜达标=%s\n' \
-    "$RESULT_MBPS" "$RESULT_RETRANS" "$RESULT_RETRANS_PERCENT" "$RESULT_SCORE" "$RESULT_PASS"
+  printf '\n  平均下载吞吐：%s Mbps\n' "$RESULT_MBPS"
+  printf '  TCP 重传次数：%s 次\n' "$RESULT_RETRANS"
+  printf '  估算重传率：%s%%\n' "$RESULT_RETRANS_PERCENT"
+  if awk -v v="$RESULT_RTT_MS" 'BEGIN {exit !(v>0)}'; then
+    printf '  TCP 平均 RTT：%s ms\n' "$RESULT_RTT_MS"
+  else
+    printf '  TCP 平均 RTT：未取得\n'
+  fi
+  printf '  是否达到目标：%s\n\n' "$(format_pass "$RESULT_PASS")"
 }
-
 record_result() {
   local stage="$1" config="$2" streams="$3" buffer_mib="$4" factor="$5"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$stage" "$config" "$streams" "$buffer_mib" "$factor" "$RESULT_MBPS" "$RESULT_RETRANS" \
-    "$RESULT_RETRANS_PERCENT" "$RESULT_SCORE" "$RESULT_PASS" >>"$REPORT_FILE"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$stage" "$SEARCH_ROUNDS" "$config" "$streams" "$buffer_mib" "$factor" "$RESULT_RTT_MS" \
+    "$RESULT_MBPS" "$RESULT_RETRANS" "$RESULT_RETRANS_PERCENT" "$RESULT_SCORE" "$RESULT_PASS" >>"$REPORT_FILE"
 }
 
 abort_without_changes() {
@@ -923,74 +1014,110 @@ stop_tuning_on_signal() {
 
 write_comparison() {
   local iface="$1" final_buffer="$2" delta delta_retrans after_cc after_qdisc after_rmem after_wmem
+  local speed_summary retrans_summary outcome_summary overshoot_summary
   delta="$(awk -v a="$BASELINE_MBPS" -v b="$FINAL_MBPS" 'BEGIN {if(a<=0)print "0.00";else printf "%.2f",(b-a)/a*100}')"
   delta_retrans="$(awk -v a="$BASELINE_RETRANS_PERCENT" -v b="$FINAL_RETRANS_PERCENT" 'BEGIN {printf "%.4f",b-a}')"
   after_cc="$(sysctl_get net.ipv4.tcp_congestion_control)"
   after_qdisc="$(root_qdisc_kind "$iface")"
   after_rmem="$(sysctl_get net.ipv4.tcp_rmem)"
   after_wmem="$(sysctl_get net.ipv4.tcp_wmem)"
+  if awk -v d="$delta" 'BEGIN {exit !(d>0.005)}'; then
+    speed_summary="下载速度提高 ${delta}%（${BASELINE_MBPS} → ${FINAL_MBPS} Mbps）"
+  elif awk -v d="$delta" 'BEGIN {exit !(d< -0.005)}'; then
+    speed_summary="下载速度下降 ${delta#-}%（${BASELINE_MBPS} → ${FINAL_MBPS} Mbps）"
+  else
+    speed_summary="下载速度基本不变（${BASELINE_MBPS} → ${FINAL_MBPS} Mbps）"
+  fi
+  if awk -v d="$delta_retrans" 'BEGIN {exit !(d< -0.00005)}'; then
+    retrans_summary="重传率下降 ${delta_retrans#-} 个百分点，稳定性改善"
+  elif awk -v d="$delta_retrans" 'BEGIN {exit !(d>0.00005)}'; then
+    retrans_summary="重传率上升 ${delta_retrans} 个百分点"
+  else
+    retrans_summary="重传率基本不变"
+  fi
+  case "$OUTCOME" in
+    optimized-runtime) outcome_summary="已选出实测最优参数，目前仅在运行中生效；确认后可取消安全回滚" ;;
+    optimized-persistent) outcome_summary="已选出实测最优参数，并已写入开机配置" ;;
+    baseline-retained) outcome_summary="新参数没有超过原配置，已保留调优前参数" ;;
+    baseline-restored-after-confirmation) outcome_summary="最优候选复测不稳定，已恢复调优前参数" ;;
+    *) outcome_summary="$OUTCOME" ;;
+  esac
+  if (( OVERSHOOT_DETECTED )); then
+    overshoot_summary="已在 ${OVERSHOOT_MIB} MiB 检测到性能回落，并完成回退精调"
+  else
+    overshoot_summary="未出现明显回落；搜索到总内存预算允许的上限"
+  fi
+
   cat >"$COMPARISON_FILE" <<EOF_COMPARE
-TCP/BBR 调优详细对比
+TCP/BBR 调优前后对比
 ====================
-会话：${SESSION_ID}
-时间：$(date '+%Y-%m-%dT%H:%M:%S%z')
-服务器：${SERVER_ADDRESS}
+
+一眼看懂
+--------
+结论：${outcome_summary}
+速度：${speed_summary}
+稳定性：${retrans_summary}
+搜索过程：${overshoot_summary}
+
+本次测试条件
+------------
+会话编号：${SESSION_ID}
+测试时间：$(date '+%Y-%m-%d %H:%M:%S %z')
+测试方向：远程服务器 → 本地电脑（iperf3 -R）
+服务器地址：${SERVER_ADDRESS}
 出口网卡：${iface}
-目标：${TARGET_MBPS} Mbps × ${TARGET_UTILIZATION}%
-RTT：${RTT_MS} ms
-测试并发：${BASELINE_STREAMS}
+目标带宽：${TARGET_MBPS} Mbps
+目标含义：服务器出站、本地下载和中间链路三者可达到上限中的较小值
+达标门槛：目标带宽的 ${TARGET_UTILIZATION}% 且估算重传率不高于 ${MAX_RETRANS_PERCENT}%
+自动 RTT：${RTT_MS} ms（${RTT_SOURCE}）
+测试并发：${BASELINE_STREAMS} 个 TCP 流
+候选搜索轮数：${SEARCH_ROUNDS}
 
-服务器内存与缓存预算
---------------------
-物理内存：${MEM_TOTAL_MIB} MiB
-可用内存：${MEM_AVAILABLE_MIB} MiB
-有效内存上限：${MEM_EFFECTIVE_MIB} MiB
-自动 TCP 单连接缓存上限：${MEM_BUFFER_CAP_MIB} MiB
-BDP：${BDP_MIB} MiB
+服务器总内存与缓存预算
+----------------------
+物理总内存：$(format_mib "$MEM_TOTAL_MIB")
+当前可用内存：$(format_mib "$MEM_AVAILABLE_MIB")（仅记录，不参与缓存上限计算）
+用于分档的总内存：$(format_mib "$MEM_EFFECTIVE_MIB")（物理总内存与 cgroup 总上限取较小值）
+TCP 单连接缓存预算：$(format_mib "$MEM_BUFFER_CAP_MIB")（用于分档的总内存 ÷ 64）
+本链路 BDP：${BDP_MIB} MiB
 
-调优前
-------
-拥塞算法：${BEFORE_CC}
-root qdisc：${BEFORE_QDISC}
-tcp_rmem：${BEFORE_RMEM}
-tcp_wmem：${BEFORE_WMEM}
-全局缓存上限：${BEFORE_BUFFER_BYTES} bytes
-吞吐：${BASELINE_MBPS} Mbps
-Retr：${BASELINE_RETRANS}
-估算重传比例：${BASELINE_RETRANS_PERCENT}%
-达标：${BASELINE_PASS}
+关键结果
+--------
+| 项目 | 调优前 | 调优后 |
+|---|---:|---:|
+| 下载吞吐 | ${BASELINE_MBPS} Mbps | ${FINAL_MBPS} Mbps |
+| TCP 重传次数 | ${BASELINE_RETRANS} | ${FINAL_RETRANS} |
+| 估算重传率 | ${BASELINE_RETRANS_PERCENT}% | ${FINAL_RETRANS_PERCENT}% |
+| 是否达到目标 | $(format_pass "$BASELINE_PASS") | $(format_pass "$FINAL_PASS") |
+| 拥塞控制算法 | ${BEFORE_CC} | ${after_cc} |
+| 出口队列规则 | ${BEFORE_QDISC} | ${after_qdisc} |
+| 缓存最大值 | $(format_bytes_mib "$BEFORE_BUFFER_BYTES") | $(format_bytes_mib "$final_buffer") |
 
-调优后
-------
-结果：${OUTCOME}
-拥塞算法：${after_cc}
-root qdisc：${after_qdisc}
-tcp_rmem：${after_rmem}
-tcp_wmem：${after_wmem}
-最终缓存上限：${final_buffer} bytes
-吞吐：${FINAL_MBPS} Mbps
-Retr：${FINAL_RETRANS}
-估算重传比例：${FINAL_RETRANS_PERCENT}%
-达标：${FINAL_PASS}
-
-变化
-----
-吞吐变化：${delta}%
-重传比例变化：${delta_retrans} 个百分点
+TCP 参数明细
+------------
+tcp_rmem 调优前：${BEFORE_RMEM}
+tcp_rmem 调优后：${after_rmem}
+tcp_wmem 调优前：${BEFORE_WMEM}
+tcp_wmem 调优后：${after_wmem}
 最优候选：${BEST_KIND}
-最优 BDP 系数：${BEST_FACTOR}
-单流 QoS 特征：$([[ "$QOS_DETECTED" == "1" ]] && echo yes || echo no)
-
-文件
-----
-运行日志：${RUN_LOG}
-逐轮数据：${REPORT_FILE}
-调优前状态：${SESSION_DIR}/system-before.txt
-调优后状态：${SESSION_DIR}/system-after.txt
+最优缓存：${BEST_BUFFER_MIB} MiB
+最优缓存 / BDP：${BEST_FACTOR} 倍
+单流 QoS 特征：$([[ "$QOS_DETECTED" == "1" ]] && echo "是" || echo "否")
 EOF_COMPARE
+
+  {
+    printf '\n逐轮测试记录\n------------\n'
+    printf '| 阶段 | 轮次 | 并发 | 缓存 MiB | RTT ms | 吞吐 Mbps | 重传率 | 达标 |\n'
+    printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
+    awk -F '\t' 'NR>1 {passed=($12=="yes"?"是":"否"); printf "| %s | %s | %s | %s | %s | %s | %s%% | %s |\n",$1,$2,$4,$5,$7,$8,$10,passed}' "$REPORT_FILE"
+    printf '\n日志文件\n--------\n'
+    printf '完整运行日志：%s\n' "$RUN_LOG"
+    printf '结构化逐轮数据：%s\n' "$REPORT_FILE"
+    printf '调优前系统状态：%s/system-before.txt\n' "$SESSION_DIR"
+    printf '调优后系统状态：%s/system-after.txt\n' "$SESSION_DIR"
+  } >>"$COMPARISON_FILE"
   cat "$COMPARISON_FILE"
 }
-
 append_history() {
   local delta
   mkdir -p "$STATE_DIR"
@@ -1010,7 +1137,8 @@ autotune() {
   init_session
   install_iperf3_if_needed
 
-  local iface address root_kind next_stream first_speed candidate_count=0 index mib factor no_improve=0 previous_best
+  local iface address root_kind next_stream first_speed candidate_count=0 index mib factor previous_best
+  local lower upper midpoint gain
   iface="$(resolve_iface)"
   [[ -n "$iface" ]] || die "无法识别出口网卡"
   ip link show dev "$iface" >/dev/null 2>&1 || die "出口网卡不存在：$iface"
@@ -1019,9 +1147,11 @@ autotune() {
   SERVER_ADDRESS="$address"
   TEST_PORT="$(choose_random_port)" || die "无法找到未占用的随机端口"
 
+  RTT_MS=""; RTT_SOURCE=""
+  SEARCH_ROUNDS=0; OVERSHOOT_DETECTED=0; OVERSHOOT_MIB=0
+  BEST_KIND="baseline"; BEST_BUFFER_MIB=0; BEST_FACTOR="原配置"; QOS_DETECTED=0
+
   detect_memory_limits
-  calculate_bdp
-  generate_candidates
   ensure_bbr
 
   BEFORE_CC="$(sysctl_get net.ipv4.tcp_congestion_control)"
@@ -1037,28 +1167,48 @@ autotune() {
   capture_state "$iface" "${SESSION_DIR}/system-before.txt"
 
   section "自动寻优会话 ${SESSION_ID}"
-  printf '服务器：%s\n出口网卡：%s\n随机端口：%s\n目标带宽：%s Mbps\nRTT：%s ms\n' \
-    "$address" "$iface" "$TEST_PORT" "$TARGET_MBPS" "$RTT_MS"
-  printf '内存：总计 %s MiB，可用 %s MiB，TCP 缓存自动上限 %s MiB\n' \
-    "$MEM_TOTAL_MIB" "$MEM_AVAILABLE_MIB" "$MEM_BUFFER_CAP_MIB"
-  printf 'BDP：%s MiB；候选缓存：' "$BDP_MIB"
-  printf '%sMiB ' "${CANDIDATE_MIBS[@]}"
-  printf '\n日志目录：%s\n' "$SESSION_DIR"
-  warn "脚本不会修改本地电脑，也不会自动开放服务器防火墙；请允许 TCP ${TEST_PORT}"
+  printf '  测试方向：远程服务器 → 本地电脑\n'
+  printf '  服务器地址：%s\n' "$address"
+  printf '  出口网卡：%s\n' "$iface"
+  printf '  目标带宽：%s Mbps\n' "$TARGET_MBPS"
+  printf '  目标带宽含义：服务器出站、本地下载和中间链路上限中的较小值\n'
+  printf '  RTT：首轮 iperf3 自动测量\n'
+  printf '  随机测试端口：%s\n' "$TEST_PORT"
+  printf '  总内存分档基数：%s\n' "$(format_mib "$MEM_EFFECTIVE_MIB")"
+  printf '  TCP 缓存预算：%s\n' "$(format_mib "$MEM_BUFFER_CAP_MIB")"
+  printf '  连接等待 / 安全回滚：%s 秒 / %s 秒\n' "$WAIT_SECONDS" "$AUTO_ROLLBACK_SECONDS"
+  printf '  日志目录：%s\n\n' "$SESSION_DIR"
+  warn "请确认云安全组和服务器防火墙允许 TCP ${TEST_PORT}；脚本不会修改本地电脑"
 
   trap abort_without_changes INT TERM
   TEST_STREAMS="$START_STREAMS"
-  run_reverse_test "before-p${TEST_STREAMS}" "$TEST_STREAMS" "$address"
+  run_reverse_test "before-p${TEST_STREAMS}" "$TEST_STREAMS" "$address" "调优前基线"
   record_result before original "$TEST_STREAMS" "$(awk -v b="$BEFORE_BUFFER_BYTES" 'BEGIN {printf "%.2f",b/1048576}')" original
   INITIAL_SINGLE_MBPS="$RESULT_MBPS"
   first_speed="$RESULT_MBPS"
+  adopt_measured_rtt
+  if [[ -z "$RTT_MS" ]]; then
+    die "无法自动取得本地与服务器之间的 RTT；请检查 iperf3 JSON、ss 或客户端 ICMP 可达性"
+  fi
+  calculate_bdp
+  generate_candidates
+
+  section "链路自动测量与搜索范围"
+  printf '  实测 TCP RTT：%s ms（%s）\n' "$RTT_MS" "$RTT_SOURCE"
+  printf '  目标链路 BDP：%s MiB\n' "$BDP_MIB"
+  printf '  缓存搜索起点：%s MiB\n' "${CANDIDATE_MIBS[0]}"
+  printf '  缓存安全上限：%s MiB\n' "$MEM_BUFFER_CAP_MIB"
+  printf '  搜索方式：倍增逼近；性能回落后二分回退到 1 MiB 粒度\n\n'
+  if awk -v b="$BDP_MIB" -v c="$MEM_BUFFER_CAP_MIB" 'BEGIN {exit !(b>c)}'; then
+    warn "目标 BDP 大于按服务器总内存计算的缓存预算；不会突破内存安全上限"
+  fi
 
   while result_low_speed_low_retrans; do
     next_stream="$(next_stream_count "$TEST_STREAMS")"
     [[ "$next_stream" != "$TEST_STREAMS" ]] || break
     TEST_STREAMS="$next_stream"
-    info "低重传但吞吐不足，增加到 ${TEST_STREAMS} 个并发流以识别单流 QoS"
-    run_reverse_test "before-p${TEST_STREAMS}" "$TEST_STREAMS" "$address"
+    info "单流重传较低但速度不足，改用 ${TEST_STREAMS} 个并发流判断是否存在单流 QoS"
+    run_reverse_test "before-p${TEST_STREAMS}" "$TEST_STREAMS" "$address" "调优前并发诊断"
     record_result before original "$TEST_STREAMS" "$(awk -v b="$BEFORE_BUFFER_BYTES" 'BEGIN {printf "%.2f",b/1048576}')" original
   done
 
@@ -1073,12 +1223,12 @@ autotune() {
   BEST_RETRANS_PERCENT="$BASELINE_RETRANS_PERCENT"
   BEST_SCORE="$BASELINE_SCORE"
   BEST_PASS="$BASELINE_PASS"
+  BEST_BUFFER_MIB="$(awk -v b="$BASELINE_BUFFER_BYTES" 'BEGIN {printf "%.2f",b/1048576}')"
 
   if (( BASELINE_STREAMS > START_STREAMS )); then
-    local gain
     gain="$(awk -v a="$first_speed" -v b="$BASELINE_MBPS" 'BEGIN {if(a<=0)print 0;else printf "%.2f",(b-a)/a*100}')"
     if awk -v g="$gain" 'BEGIN {exit !(g>=15)}'; then QOS_DETECTED="1"; fi
-    info "并发诊断：${START_STREAMS} 流 ${first_speed} Mbps → ${BASELINE_STREAMS} 流 ${BASELINE_MBPS} Mbps，变化 ${gain}%"
+    info "并发诊断完成：${START_STREAMS} 流 ${first_speed} Mbps → ${BASELINE_STREAMS} 流 ${BASELINE_MBPS} Mbps（${gain}%）"
   fi
 
   trap - INT TERM
@@ -1088,18 +1238,18 @@ autotune() {
   trap stop_tuning_on_signal INT TERM
   schedule_rollback "$BACKUP_DIR"
 
-  section "测试内存感知的 TCP 候选参数"
+  section "第一阶段：持续增大 TCP 缓存，逼近性能边界"
   for ((index=0; index<${#CANDIDATE_MIBS[@]}; index++)); do
     mib="${CANDIDATE_MIBS[$index]}"
     factor="${CANDIDATE_FACTORS[$index]}"
-    candidate_count=$((candidate_count+1))
-    info "候选 ${candidate_count}/${#CANDIDATE_MIBS[@]}：BBR + fq，buffer=${mib} MiB，BDP 系数=${factor}"
+    candidate_count=$((candidate_count+1)); SEARCH_ROUNDS="$candidate_count"
+    printf '\n[SEARCH] 第 %-3s 轮｜扩大探索｜缓存 %6s MiB｜约 %5s × BDP\n' "$SEARCH_ROUNDS" "$mib" "$factor"
     apply_candidate "$iface" "$mib"
-    run_reverse_test "candidate-${candidate_count}-${mib}m" "$BASELINE_STREAMS" "$address"
+    run_reverse_test "candidate-${SEARCH_ROUNDS}-${mib}m" "$BASELINE_STREAMS" "$address" "候选 ${SEARCH_ROUNDS}（扩大探索）"
     record_result candidate bbr-fq "$BASELINE_STREAMS" "$mib" "$factor"
     previous_best="$BEST_SCORE"
     if result_better_than "$RESULT_SCORE" "$BEST_SCORE"; then
-      BEST_KIND="candidate-${candidate_count}"
+      BEST_KIND="candidate-${SEARCH_ROUNDS}"
       BEST_BUFFER_MIB="$mib"
       BEST_FACTOR="$factor"
       BEST_MBPS="$RESULT_MBPS"
@@ -1107,20 +1257,53 @@ autotune() {
       BEST_RETRANS_PERCENT="$RESULT_RETRANS_PERCENT"
       BEST_SCORE="$RESULT_SCORE"
       BEST_PASS="$RESULT_PASS"
-      no_improve=0
-      info "当前最优更新：${BEST_MBPS} Mbps，重传 ${BEST_RETRANS_PERCENT}%"
-    else
-      no_improve=$((no_improve+1))
-      info "该候选未超过当前最优 score=${previous_best}"
-    fi
-    if (( candidate_count >= 2 && no_improve >= 2 )); then
-      info "连续两个更大缓存未带来改善，判定已进入性能平台，停止继续放大缓存"
+      info "更新最优：缓存 ${mib} MiB｜吞吐 ${BEST_MBPS} Mbps｜重传率 ${BEST_RETRANS_PERCENT}%"
+    elif [[ "$BEST_KIND" != "baseline" ]] && (( mib > BEST_BUFFER_MIB )) && candidate_regressed "$RESULT_SCORE" "$BEST_SCORE"; then
+      OVERSHOOT_DETECTED=1
+      OVERSHOOT_MIB="$mib"
+      warn "检测到性能边界：${mib} MiB 已低于当前最优 ${BEST_BUFFER_MIB} MiB，开始回退精调"
       break
+    else
+      info "本轮没有超过当前最优（本轮 ${RESULT_MBPS} Mbps，当前最优 ${BEST_MBPS} Mbps），继续向上测试"
     fi
   done
 
+  if (( OVERSHOOT_DETECTED )) && [[ "$BEST_KIND" != "baseline" ]]; then
+    lower="${BEST_BUFFER_MIB%.*}"
+    upper="$OVERSHOOT_MIB"
+    section "第二阶段：在 ${lower}～${upper} MiB 之间回退精调"
+    while (( upper - lower > 1 )); do
+      midpoint=$(( (lower + upper) / 2 ))
+      factor="$(candidate_factor "$midpoint")"
+      candidate_count=$((candidate_count+1)); SEARCH_ROUNDS="$candidate_count"
+      printf '\n[SEARCH] 第 %-3s 轮｜回退精调｜缓存 %6s MiB｜约 %5s × BDP\n' "$SEARCH_ROUNDS" "$midpoint" "$factor"
+      apply_candidate "$iface" "$midpoint"
+      run_reverse_test "candidate-${SEARCH_ROUNDS}-${midpoint}m" "$BASELINE_STREAMS" "$address" "候选 ${SEARCH_ROUNDS}（回退精调）"
+      record_result candidate bbr-fq "$BASELINE_STREAMS" "$midpoint" "$factor"
+      if result_better_than "$RESULT_SCORE" "$BEST_SCORE"; then
+        BEST_KIND="candidate-${SEARCH_ROUNDS}"
+        BEST_BUFFER_MIB="$midpoint"
+        BEST_FACTOR="$factor"
+        BEST_MBPS="$RESULT_MBPS"
+        BEST_RETRANS="$RESULT_RETRANS"
+        BEST_RETRANS_PERCENT="$RESULT_RETRANS_PERCENT"
+        BEST_SCORE="$RESULT_SCORE"
+        BEST_PASS="$RESULT_PASS"
+        lower="$midpoint"
+        info "精调发现更优值：缓存 ${midpoint} MiB｜吞吐 ${BEST_MBPS} Mbps｜重传率 ${BEST_RETRANS_PERCENT}%"
+      elif candidate_regressed "$RESULT_SCORE" "$BEST_SCORE"; then
+        upper="$midpoint"
+        info "${midpoint} MiB 已越过最优区域，继续向下回退"
+      else
+        lower="$midpoint"
+        info "${midpoint} MiB 与当前最优基本持平，继续向上逼近边界"
+      fi
+    done
+    info "回退精调完成：边界已收敛到 ${lower}～${upper} MiB，选择实测分数最高的 ${BEST_BUFFER_MIB} MiB"
+  fi
+
   if [[ "$BEST_KIND" == "baseline" ]]; then
-    info "所有候选均未超过调优前配置，恢复并保留原参数"
+    info "全部安全候选均未超过调优前配置，恢复并保留原参数"
     cancel_rollback_for_backup "$BACKUP_DIR"
     restore_backup "$BACKUP_DIR"
     TUNING_ACTIVE="0"
@@ -1133,9 +1316,9 @@ autotune() {
     FINAL_BUFFER_BYTES="$BASELINE_BUFFER_BYTES"
     trap - INT TERM
   else
-    section "复测最优候选 ${BEST_KIND}"
+    section "最终复测：应用实测最优缓存 ${BEST_BUFFER_MIB} MiB"
     apply_candidate "$iface" "$BEST_BUFFER_MIB"
-    run_reverse_test "final-${BEST_BUFFER_MIB}m" "$BASELINE_STREAMS" "$address"
+    run_reverse_test "final-${BEST_BUFFER_MIB}m" "$BASELINE_STREAMS" "$address" "最优参数复测"
     record_result final bbr-fq "$BASELINE_STREAMS" "$BEST_BUFFER_MIB" "$BEST_FACTOR"
     FINAL_MBPS="$RESULT_MBPS"
     FINAL_RETRANS="$RESULT_RETRANS"
@@ -1156,6 +1339,8 @@ autotune() {
       FINAL_SCORE="$BASELINE_SCORE"
       FINAL_PASS="$BASELINE_PASS"
       FINAL_BUFFER_BYTES="$BASELINE_BUFFER_BYTES"
+      BEST_BUFFER_MIB="$(awk -v b="$BASELINE_BUFFER_BYTES" 'BEGIN {printf "%.2f",b/1048576}')"
+      BEST_FACTOR="原配置"
       trap - INT TERM
     else
       OUTCOME="optimized-runtime"
@@ -1166,9 +1351,9 @@ autotune() {
       fi
       trap - INT TERM
       if (( AUTO_ROLLBACK_SECONDS > 0 )); then
-        warn "最优参数已保留；请另开 SSH 验证后执行 sudo $PROGRAM confirm"
+        warn "最优参数已生效；请在 ${AUTO_ROLLBACK_SECONDS} 秒内另开 SSH 验证，然后执行 sudo $PROGRAM confirm"
       else
-        warn "最优参数已保留，但本次关闭了安全回滚"
+        warn "最优参数已生效；本次运行未启用定时安全回滚"
       fi
     fi
   fi
@@ -1179,29 +1364,38 @@ autotune() {
   TUNING_ACTIVE="0"
   trap - EXIT
   if [[ "$FINAL_PASS" != "yes" ]]; then
-    warn "最优结果仍未达到设定目标，但已经选择实测分数最高且复测稳定的配置"
+    warn "最终结果仍未达到设定目标；脚本已在内存安全范围内选择实测最优配置"
   fi
   if (( QOS_DETECTED )); then
-    warn "检测到单流 QoS 特征；业务传输建议使用 8~16 个并发连接"
+    warn "检测到单流 QoS 特征；业务传输建议使用 8～16 个并发连接"
   fi
   info "完整日志：$RUN_LOG"
-  info "详细对比：$COMPARISON_FILE"
+  info "通俗对比报告：$COMPARISON_FILE"
 }
-
 status_command() {
   require_linux
   for cmd in ip tc sysctl awk; do have "$cmd" || die "缺少命令：$cmd"; done
-  local iface
+  local iface rmax wmax
   iface="$(resolve_iface)"
+  detect_memory_limits
+  rmax="$(sysctl_get net.core.rmem_max)"
+  wmax="$(sysctl_get net.core.wmem_max)"
   section "当前服务器 TCP/BBR 状态"
-  printf '时间：%s\n内核：%s\n出口网卡：%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$(uname -srmo)" "$iface"
-  printf '拥塞算法：%s\n' "$(sysctl_get net.ipv4.tcp_congestion_control)"
-  printf '可用算法：%s\n' "$(sysctl_get net.ipv4.tcp_available_congestion_control)"
-  printf '默认 qdisc：%s\n' "$(sysctl_get net.core.default_qdisc)"
-  printf 'root qdisc：%s\n' "$(root_qdisc_kind "$iface")"
-  printf 'tcp_rmem：%s\n' "$(sysctl_get net.ipv4.tcp_rmem)"
-  printf 'tcp_wmem：%s\n' "$(sysctl_get net.ipv4.tcp_wmem)"
-  printf 'rmem_max：%s\nwmem_max：%s\n' "$(sysctl_get net.core.rmem_max)" "$(sysctl_get net.core.wmem_max)"
+  printf '  时间：%s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+  printf '  内核：%s\n' "$(uname -srmo)"
+  printf '  出口网卡：%s\n' "$iface"
+  printf '  拥塞控制算法：%s\n' "$(sysctl_get net.ipv4.tcp_congestion_control)"
+  printf '  内核可用算法：%s\n' "$(sysctl_get net.ipv4.tcp_available_congestion_control)"
+  printf '  系统默认队列：%s\n' "$(sysctl_get net.core.default_qdisc)"
+  printf '  出口实际队列：%s\n' "$(root_qdisc_kind "$iface")"
+  printf '  服务器物理总内存：%s\n' "$(format_mib "$MEM_TOTAL_MIB")"
+  printf '  缓存分档总内存：%s\n' "$(format_mib "$MEM_EFFECTIVE_MIB")"
+  printf '  自动缓存预算：%s\n' "$(format_mib "$MEM_BUFFER_CAP_MIB")"
+  printf '  接收缓存硬上限：%s\n' "$(format_bytes_mib "$rmax")"
+  printf '  发送缓存硬上限：%s\n' "$(format_bytes_mib "$wmax")"
+  printf '  tcp_rmem（最小/默认/最大）：%s\n' "$(sysctl_get net.ipv4.tcp_rmem)"
+  printf '  tcp_wmem（最小/默认/最大）：%s\n' "$(sysctl_get net.ipv4.tcp_wmem)"
+  printf '\n队列详细统计\n------------\n'
   tc -s -d qdisc show dev "$iface" || true
 }
 
@@ -1211,10 +1405,12 @@ history_command() {
     return
   fi
   section "TCP/BBR 历史测试"
-  if have column; then column -t -s $'\t' "$HISTORY_FILE"; else cat "$HISTORY_FILE"; fi
-  printf '\n每个会话的完整日志位于：%s\n' "$SESSION_ROOT"
+  printf '| 时间 | 会话 | 目标 Mbps | RTT ms | 调优前 Mbps | 调优后 Mbps | 变化 | 缓存 MiB | 结果 |\n'
+  printf '|---|---|---:|---:|---:|---:|---:|---:|---|\n'
+  awk -F '\t' 'NR>1 {printf "| %s | %s | %s | %s | %s | %s | %s%% | %s | %s |\n",$1,$2,$3,$4,$6,$7,$8,$11,$12}' "$HISTORY_FILE"
+  printf '\n完整历史数据：%s\n' "$HISTORY_FILE"
+  printf '每个会话的日志目录：%s\n' "$SESSION_ROOT"
 }
-
 ui_init() {
   if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     UI_BLUE=$'\033[1;36m'; UI_GREEN=$'\033[1;32m'; UI_YELLOW=$'\033[1;33m'; UI_RED=$'\033[1;31m'; UI_RESET=$'\033[0m'
@@ -1278,29 +1474,31 @@ ui_execute() {
 }
 
 ui_autotune() {
-  local address bandwidth rtt streams duration candidates util retrans wait rollback
+  local address bandwidth streams duration util retrans
   local args=()
   address="$(guess_server_address 2>/dev/null || true)"
-  bandwidth="$(ui_read_number "目标带宽 Mbps" "1000" "1" "100000")" || return
-  rtt="$(ui_read_number "本地到服务器 RTT ms" "100" "0.1" "5000")" || return
+  printf '%s目标带宽说明%s\n' "$UI_YELLOW" "$UI_RESET"
+  printf '  本工具测试“远程服务器 → 本地电脑”的下载方向。\n'
+  printf '  建议填写：服务器出站带宽上限与本地下载带宽上限中的较小值。\n'
+  printf '  例如服务器限速 200 Mbps、本地宽带 1000 Mbps，应填写 200。\n\n'
+  bandwidth="$(ui_read_number "期望端到端下载带宽 Mbps" "1000" "1" "100000")" || return
   address="$(ui_read_text "服务器公网 IP 或域名" "$address")" || return
   [[ -n "$address" ]] || { printf '%s服务器地址不能为空%s\n' "$UI_RED" "$UI_RESET"; return; }
   streams="$(ui_read_number "起始并发流" "1" "1" "64")" || return
   duration="$(ui_read_number "每轮测试秒数" "15" "5" "300")" || return
-  candidates="$(ui_read_number "最多测试候选数量" "4" "1" "6")" || return
   util="$(ui_read_number "目标带宽利用率 %" "90" "1" "100")" || return
-  retrans="$(ui_read_number "最大估算重传比例 %" "1" "0" "100")" || return
-  wait="$(ui_read_number "每轮等待本地连接秒数" "300" "30" "3600")" || return
-  rollback="$(ui_read_number "安全回滚秒数" "3600" "300" "86400")" || return
-  if ui_yes_no "最优参数通过复测后持久化" "n"; then args+=(--persist); fi
-  printf '\n%s说明：%s脚本将在服务器端依次测试候选参数；每轮只需在本地执行屏幕显示的 iperf3 命令。\n' "$UI_YELLOW" "$UI_RESET"
+  retrans="$(ui_read_number "最大估算重传率 %" "1" "0" "100")" || return
+  if ui_yes_no "最优参数通过复测后写入开机配置" "n"; then args+=(--persist); fi
+  printf '\n%s自动规则%s\n' "$UI_YELLOW" "$UI_RESET"
+  printf '  • RTT 由首轮 iperf3 自动测量。\n'
+  printf '  • 候选数量不设人工上限，发现性能回落后自动回退精调。\n'
+  printf '  • 每轮等待本地连接 %s 秒；安全回滚固定为 %s 秒。\n' "$WAIT_SECONDS" "$AUTO_ROLLBACK_SECONDS"
+  printf '  • 本地只执行测速命令，不修改任何本地 TCP 参数。\n\n'
   ui_yes_no "开始自动寻优" "n" || return
-  ui_execute 1 autotune --bandwidth-mbps "$bandwidth" --rtt-ms "$rtt" --server-address "$address" \
-    --parallel "$streams" --duration "$duration" --max-candidates "$candidates" \
-    --target-utilization "$util" --max-retrans-percent "$retrans" --wait-seconds "$wait" \
-    --auto-rollback-seconds "$rollback" "${args[@]}"
+  ui_execute 1 autotune --bandwidth-mbps "$bandwidth" --server-address "$address" \
+    --parallel "$streams" --duration "$duration" \
+    --target-utilization "$util" --max-retrans-percent "$retrans" "${args[@]}"
 }
-
 menu() {
   [[ -t 0 && -t 1 ]] || { usage; return; }
   require_linux

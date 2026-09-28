@@ -38,6 +38,8 @@ assert_eq "$RESULT_MBPS" "800.00" "JSON throughput parser"
 assert_eq "$RESULT_BYTES" "125000000" "JSON byte parser"
 assert_eq "$RESULT_RETRANS" "1000" "JSON retrans parser"
 assert_eq "$RESULT_RETRANS_PERCENT" "1.1584" "JSON retrans percentage"
+assert_eq "$RESULT_RTT_MS" "180.00" "JSON TCP RTT parser"
+assert_eq "$RESULT_CLIENT_ADDRESS" "198.51.100.8" "JSON client address parser"
 
 # Exercise the minimal-server parser without Python.
 (
@@ -45,6 +47,8 @@ assert_eq "$RESULT_RETRANS_PERCENT" "1.1584" "JSON retrans percentage"
   parse_iperf_json "${ROOT}/tests/fixtures/iperf3-reverse.json"
   assert_eq "$RESULT_MBPS" "800.00" "awk fallback throughput"
   assert_eq "$RESULT_RETRANS" "1000" "awk fallback retrans"
+  assert_eq "$RESULT_RTT_MS" "180.00" "awk fallback TCP RTT"
+  assert_eq "$RESULT_CLIENT_ADDRESS" "198.51.100.8" "awk fallback client address"
 )
 
 TARGET_MBPS="1000"
@@ -102,8 +106,8 @@ if grep -qi 'prompt' "${ROOT}/bbr-tune.sh"; then fail "script must not expose pr
   STATE_DIR="$sim/state"; SESSION_ROOT="${STATE_DIR}/sessions"; BACKUP_ROOT="${STATE_DIR}/backups"
   LATEST_BACKUP="${STATE_DIR}/latest"; PENDING_DIR="${STATE_DIR}/pending"; PENDING_LATEST="${STATE_DIR}/pending-latest"
   HISTORY_FILE="${STATE_DIR}/history.tsv"
-  TARGET_MBPS="1000"; RTT_MS="180"; START_STREAMS="1"; TEST_STREAMS="1"
-  TARGET_UTILIZATION="90"; MAX_RETRANS_PERCENT="1"; MAX_CANDIDATES="4"; AUTO_ROLLBACK_SECONDS="0"
+  TARGET_MBPS="1000"; START_STREAMS="1"; TEST_STREAMS="1"
+  TARGET_UTILIZATION="90"; MAX_RETRANS_PERCENT="1"; AUTO_ROLLBACK_SECONDS="0"
   SERVER_ADDRESS="speed.example.com"; IFACE="auto"; PERSIST_FINAL="0"; FORCE="0"
   require_linux() { :; }; require_root() { :; }; have() { return 0; }; pending_guard() { :; }
   install_iperf3_if_needed() { :; }; ensure_bbr() { :; }; schedule_rollback() { :; }
@@ -126,7 +130,7 @@ if grep -qi 'prompt' "${ROOT}/bbr-tune.sh"; then fail "script must not expose pr
     SESSION_ID="simulated"; SESSION_DIR="${SESSION_ROOT}/${SESSION_ID}"; mkdir -p "$SESSION_DIR"
     RUN_LOG="${SESSION_DIR}/run.log"; REPORT_FILE="${SESSION_DIR}/results.tsv"; COMPARISON_FILE="${SESSION_DIR}/comparison.txt"
     : >"$RUN_LOG"
-    printf 'stage\tconfig\tstreams\tbuffer_mib\tfactor\tmbps\tretrans\tretrans_percent\tscore\tpassed\n' >"$REPORT_FILE"
+    printf 'stage\tround\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tscore\tpassed\n' >"$REPORT_FILE"
   }
   capture_state() { printf 'state\n' >"$2"; }
   create_backup() { local d="${BACKUP_ROOT}/${SESSION_ID}"; mkdir -p "$d"; echo "$d"; }
@@ -134,6 +138,7 @@ if grep -qi 'prompt' "${ROOT}/bbr-tune.sh"; then fail "script must not expose pr
   call=0
   run_reverse_test() {
     call=$((call+1))
+    RESULT_RTT_MS=180; RESULT_RTT_SOURCE="simulated TCP RTT"
     case "$call" in
       1) RESULT_MBPS=187.23; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.0073 ;;
       2) RESULT_MBPS=700; RESULT_RETRANS=20; RESULT_RETRANS_PERCENT=0.005 ;;
@@ -141,19 +146,27 @@ if grep -qi 'prompt' "${ROOT}/bbr-tune.sh"; then fail "script must not expose pr
       4) RESULT_MBPS=930; RESULT_RETRANS=20; RESULT_RETRANS_PERCENT=0.003 ;;
       5) RESULT_MBPS=950; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
       6) RESULT_MBPS=940; RESULT_RETRANS=17; RESULT_RETRANS_PERCENT=0.002 ;;
-      7) RESULT_MBPS=948; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
+      7) RESULT_MBPS=930; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
+      8) RESULT_MBPS=940; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
+      9) RESULT_MBPS=960; RESULT_RETRANS=16; RESULT_RETRANS_PERCENT=0.002 ;;
+      10) RESULT_MBPS=940; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
+      11) RESULT_MBPS=950; RESULT_RETRANS=18; RESULT_RETRANS_PERCENT=0.002 ;;
+      12) RESULT_MBPS=958; RESULT_RETRANS=17; RESULT_RETRANS_PERCENT=0.002 ;;
+      13) RESULT_MBPS=959; RESULT_RETRANS=17; RESULT_RETRANS_PERCENT=0.002 ;;
       *) fail "unexpected simulated test call $call" ;;
     esac
     RESULT_BYTES=1000000000
     calculate_result_quality
   }
   autotune
-  assert_eq "$call" "7" "complete search test count"
-  assert_eq "$BEST_KIND" "candidate-2" "best candidate selection"
-  assert_eq "$BEST_BUFFER_MIB" "64" "best buffer selection"
-  assert_eq "$FINAL_MBPS" "948" "final confirmation throughput"
+  assert_eq "$call" "13" "growth, overshoot, backtrack and confirmation count"
+  assert_eq "$BEST_KIND" "candidate-6" "best candidate selection"
+  assert_eq "$BEST_BUFFER_MIB" "72" "best buffer selection"
+  assert_eq "$FINAL_MBPS" "959" "final confirmation throughput"
   assert_eq "$OUTCOME" "optimized-runtime" "search outcome"
   assert_eq "$QOS_DETECTED" "1" "single-flow QoS classification"
+  assert_eq "$OVERSHOOT_DETECTED" "1" "overshoot detection"
+  assert_eq "$SEARCH_ROUNDS" "9" "unlimited adaptive search rounds"
   [[ -s "$REPORT_FILE" ]] || fail "simulated results log"
   [[ -s "$COMPARISON_FILE" ]] || fail "simulated comparison log"
   [[ -s "$HISTORY_FILE" ]] || fail "simulated history log"

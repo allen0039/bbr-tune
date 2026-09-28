@@ -37,17 +37,19 @@ mkdir -p "$SESSION_DIR"
 RUN_LOG="${SESSION_DIR}/run.log"
 REPORT_FILE="${SESSION_DIR}/results.tsv"
 COMPARISON_FILE="${SESSION_DIR}/comparison.txt"
+printf 'stage\tround\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tscore\tpassed\nfinal\t4\tbbr-fq\t8\t64\t2.98\t180\t920\t10\t0.005\t1102\tyes\n' >"$REPORT_FILE"
 SERVER_ADDRESS="speed.example.com"
 TARGET_MBPS="1000"; TARGET_UTILIZATION="90"; RTT_MS="180"; BASELINE_STREAMS="8"
-MEM_TOTAL_MIB="8192"; MEM_AVAILABLE_MIB="4096"; MEM_EFFECTIVE_MIB="8192"; MEM_BUFFER_CAP_MIB="64"; BDP_MIB="21.46"
+MEM_TOTAL_MIB="8192"; MEM_AVAILABLE_MIB="4096"; MEM_EFFECTIVE_MIB="8192"; MEM_BUFFER_CAP_MIB="64"; BDP_MIB="21.46"; RTT_SOURCE="simulated TCP RTT"
 BEFORE_CC="cubic"; BEFORE_QDISC="fq_codel"; BEFORE_RMEM="4096 131072 6291456"; BEFORE_WMEM="4096 16384 4194304"; BEFORE_BUFFER_BYTES="6291456"
 BASELINE_MBPS="600"; BASELINE_RETRANS="20"; BASELINE_RETRANS_PERCENT="0.01"; BASELINE_PASS="no"
 FINAL_MBPS="920"; FINAL_RETRANS="10"; FINAL_RETRANS_PERCENT="0.005"; FINAL_PASS="yes"
-OUTCOME="optimized-runtime"; BEST_KIND="candidate-2"; BEST_FACTOR="1.5"; QOS_DETECTED="1"
+OUTCOME="optimized-runtime"; BEST_KIND="candidate-2"; BEST_BUFFER_MIB="64"; BEST_FACTOR="2.98"; QOS_DETECTED="1"; SEARCH_ROUNDS="4"; OVERSHOOT_DETECTED="1"; OVERSHOOT_MIB="128"
 sysctl_get() { case "$1" in net.ipv4.tcp_congestion_control) echo bbr ;; net.ipv4.tcp_rmem) echo '4096 131072 67108864' ;; net.ipv4.tcp_wmem) echo '4096 16384 67108864' ;; esac; }
 root_qdisc_kind() { echo fq; }
 write_comparison eth0 67108864 >/dev/null
-grep -q '吞吐变化：53.33%' "$COMPARISON_FILE" || fail "comparison throughput delta"
-grep -q '单流 QoS 特征：yes' "$COMPARISON_FILE" || fail "comparison QoS flag"
+grep -q '下载速度提高 53.33%' "$COMPARISON_FILE" || fail "plain-language throughput delta"
+grep -q '单流 QoS 特征：是' "$COMPARISON_FILE" || fail "comparison QoS flag"
+grep -q '已在 128 MiB 检测到性能回落' "$COMPARISON_FILE" || fail "plain-language overshoot summary"
 
 printf 'All remote-role tests passed.\n'
