@@ -109,6 +109,21 @@ if k_grub_entry missing "$TMP/grub.cfg" >/dev/null 2>&1; then fail 'missing GRUB
 cat "$TMP/grub.cfg" "$TMP/grub.cfg" >"$TMP/ambiguous.cfg"
 if k_grub_entry 5.15.0-old "$TMP/ambiguous.cfg" >/dev/null 2>&1; then fail 'ambiguous GRUB entry accepted'; fi
 
+# Use the actual Debian field contract, including held packages and query errors.
+(
+  dpkg-query() {
+    [[ "$2" == '-f=${Status}\t${Version}\n' ]] || fail 'unsupported dpkg field'
+    case "$3" in
+      missing) return 1 ;;
+      broken) return 2 ;;
+      held) printf 'hold ok installed\t7.2.9-1\n' ;;
+    esac
+  }
+  eq "$(k_package_status missing)" '' 'missing package'
+  eq "$(k_package_status broken)" query-error-2 'query error fails closed'
+  eq "$(k_package_status held)" $'hold ok installed\t7.2.9-1' 'held package status'
+)
+
 # Classify an existing target before downloading large image/header assets.
 # Only an exact package, file, config and BBRv3 match may be adopted.
 (
@@ -116,15 +131,16 @@ if k_grub_entry 5.15.0-old "$TMP/ambiguous.cfg" >/dev/null 2>&1; then fail 'ambi
   mkdir -p "$K_SESSION" "$K_BOOT_DIR" "$K_MODULES_DIR"
   K_OLD=5.15.0-old; K_TARGET=7.2.9-joeyblog-bbrv3; K_META_VERSION=7.2.9-1
   printf 'CONFIG_TCP_CONG_BBR=y\nCONFIG_NET_SCH_FQ=y\n' >"$K_SESSION/release.config"
-  installed_image_version=''; installed_headers_version=''; installed_module_version=3
+  installed_image_version=''; installed_headers_version=''; installed_module_version=3; package_want=install
   dpkg-query() {
+    [[ "$2" == '-f=${Status}\t${Version}\n' ]] || fail 'invalid dpkg status field'
     local package="${*: -1}" version=''
     case "$package" in
       "linux-image-$K_TARGET") version="$installed_image_version" ;;
       "linux-headers-$K_TARGET") version="$installed_headers_version" ;;
     esac
     [[ -n "$version" ]] || return 1
-    printf 'install ok installed\t%s\n' "$version"
+    printf '%s ok installed\t%s\n' "$package_want" "$version"
   }
   modinfo() { printf '%s\n' "$installed_module_version"; }
 
@@ -140,6 +156,9 @@ if k_grub_entry 5.15.0-old "$TMP/ambiguous.cfg" >/dev/null 2>&1; then fail 'ambi
   grep -Fqx $'config_match\tyes' "$K_SESSION/existing-target.tsv" || fail 'complete config audit'
   grep -Fqx $'image_package_version\t7.2.9-1' "$K_SESSION/existing-target.tsv" || fail 'package version audit'
 
+  package_want=hold
+  eq "$(k_existing_target_state)" complete 'held installed target'
+  package_want=install
   installed_headers_version=''
   eq "$(k_existing_target_state)" conflict 'missing headers conflict'
   installed_headers_version=$K_META_VERSION; installed_image_version=7.2.9-2
@@ -155,6 +174,10 @@ if k_grub_entry 5.15.0-old "$TMP/ambiguous.cfg" >/dev/null 2>&1; then fail 'ambi
   rm -f "$K_BOOT_DIR/vmlinuz-$K_TARGET"; printf image >"$K_BOOT_DIR/vmlinuz-$K_TARGET"
   installed_image_version=''; installed_headers_version=''
   eq "$(k_existing_target_state)" conflict 'orphan vmlinuz conflict'
+
+  rm -f "$K_BOOT_DIR/vmlinuz-$K_TARGET"
+  ln -s missing "$K_BOOT_DIR/vmlinuz-$K_TARGET"
+  eq "$(k_existing_target_state)" conflict 'broken target symlink'
 
   K_OLD=$K_TARGET
   eq "$(k_existing_target_state)" running 'running target classification'
@@ -188,6 +211,7 @@ if k_grub_entry 5.15.0-old "$TMP/ambiguous.cfg" >/dev/null 2>&1; then fail 'ambi
     if [[ "$1" == -S ]]; then
       echo "linux-image-$K_OLD: $K_BOOT_DIR/vmlinuz-$K_OLD"
     elif [[ "$1" == -W ]]; then
+      [[ "$2" == '-f=${Status}\t${Version}\n' ]] || fail 'invalid dpkg status field'
       printf 'install ok installed\t%s\n' "$K_META_VERSION"
     else
       fail "unexpected package query: $*"
@@ -240,6 +264,7 @@ if k_grub_entry 5.15.0-old "$TMP/ambiguous.cfg" >/dev/null 2>&1; then fail 'ambi
     if [[ "$1" == -S ]]; then
       echo "linux-image-$K_OLD: $K_BOOT_DIR/vmlinuz-$K_OLD"
     elif [[ "$1" == -W ]]; then
+      [[ "$2" == '-f=${Status}\t${Version}\n' ]] || fail 'invalid dpkg status field'
       (( target_packages_installed )) || return 1
       printf 'install ok installed\t%s\n' "$K_META_VERSION"
     else

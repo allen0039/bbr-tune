@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.7.1"
+VERSION="2.8.0"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -55,6 +55,7 @@ FORCE="0"
 YES="0"
 BACKUP_PATH=""
 QUIET="0"
+UI_BLUE=""; UI_GREEN=""; UI_YELLOW=""; UI_RED=""; UI_RESET=""
 
 SESSION_ID=""
 SESSION_DIR=""
@@ -221,10 +222,55 @@ warn() { log_line WARN "$*" >&2; }
 error() { log_line ERROR "$*" >&2; }
 die() { error "$*"; exit 1; }
 
+ui_rule() {
+  local width=64
+  if [[ -t 1 && "${COLUMNS:-}" =~ ^[0-9]+$ ]]; then
+    width="$COLUMNS"; (( width > 72 )) && width=72
+    (( width < 20 )) && width=20
+  fi
+  printf '%*s\n' "$width" '' | tr ' ' '-'
+}
+
 section() {
-  printf '\n┌──────────────────────────────────────────────────────────────\n'
-  printf '│ %s\n' "$*"
-  printf '└──────────────────────────────────────────────────────────────\n'
+  printf '\n%s%s%s\n' "${UI_BLUE:-}" "$*" "${UI_RESET:-}"
+  ui_rule
+}
+
+process_start_id() {
+  local stat
+  [[ "$1" =~ ^[0-9]+$ && -r "/proc/$1/stat" ]] || return 1
+  stat="$(cat "/proc/$1/stat")" || return 1
+  stat="${stat##*) }"
+  awk '{print $20}' <<<"$stat"
+}
+
+stop_expired_session() {
+  local pending pid started actual token
+  [[ -n "$BACKUP_PATH" && -n "${BBR_ROLLBACK_TOKEN:-}" ]] || return 0
+  pending="$(pending_path "$BACKUP_PATH")"
+  token="$(cat "${pending}/armed" 2>/dev/null || true)"
+  [[ "$token" == "$BBR_ROLLBACK_TOKEN" && -r "${pending}/owner" ]] || return 0
+  read -r pid started <"${pending}/owner" || return 0
+  [[ "$pid" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ ]] || return 0
+  actual="$(process_start_id "$pid" || true)"
+  if [[ "$actual" == "$started" ]]; then
+    warn "安全计时器已到期，正在终止当前调优并等待参数恢复"
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+}
+
+acquire_operation_lock() {
+  require_linux; require_root
+  have flock || die "缺少 flock，请先使用一键安装补齐运行依赖"
+  umask 077
+  mkdir -p "$STATE_DIR"
+  exec 8>"${STATE_DIR}/operation.lock"
+  if [[ "${BBR_AUTO_ROLLBACK:-0}" == 1 ]]; then
+    # A watchdog must not restore the baseline while a test is applying a candidate.
+    flock 8 || die "无法取得安全回滚锁"
+  else
+    flock -n 8 || die "已有 TCP 调优、内核或更新操作正在运行；请等待完成，不要同时修改参数"
+  fi
 }
 
 usage() {
@@ -270,6 +316,7 @@ USAGE
 is_integer() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 is_number() { [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 have() { command -v "$1" >/dev/null 2>&1; }
+systemd_available() { [[ -d /run/systemd/system ]] && have systemctl; }
 require_linux() { [[ "$(uname -s)" == "Linux" ]] || die "该操作只能在远程 Linux 服务器执行"; }
 require_root() { (( EUID == 0 )) || die "该操作需要 root 权限，请使用 sudo"; }
 
@@ -325,6 +372,12 @@ configure_strategy() {
 
 validate_autotune_options() {
   configure_strategy
+  local name value
+  for name in START_STREAMS DURATION TEST_REPEATS; do
+    value="${!name}"
+    [[ "$value" =~ ^[0-9]{1,9}$ ]] || die "${name} 必须是范围内的整数"
+    printf -v "$name" '%s' "$((10#$value))"
+  done
   is_integer "$TEST_REPEATS" && (( TEST_REPEATS >= 1 && TEST_REPEATS <= 5 )) || die "复测次数必须为 1～5 的整数"
   [[ -n "$TARGET_MBPS" ]] || die "autotune 需要 --bandwidth-mbps"
   is_number "$TARGET_MBPS" || die "目标带宽必须是正数"
@@ -332,10 +385,13 @@ validate_autotune_options() {
   is_integer "$DURATION" || die "测试时长必须是整数"
   is_number "$TARGET_UTILIZATION" || die "目标利用率必须是数字"
   is_number "$MAX_RETRANS_PERCENT" || die "重传比例必须是数字"
-  awk -v v="$TARGET_MBPS" 'BEGIN {exit !(v>0)}' || die "目标带宽必须大于 0"
+  awk -v v="$TARGET_MBPS" 'BEGIN {exit !(v>0 && v<=100000)}' || die "目标带宽必须大于 0 且不超过 100000 Mbps"
   (( START_STREAMS >= 1 && START_STREAMS <= 64 )) || die "并发流数必须在 1~64"
   (( DURATION >= 5 && DURATION <= 300 )) || die "测试时长必须在 5~300 秒"
   awk -v v="$TARGET_UTILIZATION" 'BEGIN {exit !(v>0 && v<=100)}' || die "目标利用率必须在 0~100"
+  if [[ -n "$SERVER_ADDRESS" ]]; then
+    [[ "$SERVER_ADDRESS" =~ ^[a-zA-Z0-9:][a-zA-Z0-9.:%_-]*$ ]] || die "服务器地址只能填写 IP 或域名，不能包含空格、协议前缀或命令字符"
+  fi
   awk -v v="$MAX_RETRANS_PERCENT" 'BEGIN {exit !(v>=0 && v<=100)}' || die "重传比例必须在 0~100"
 }
 resolve_iface() {
@@ -700,7 +756,7 @@ BDP：${BDP_MIB} MiB；总内存技术上限：${MEM_BUFFER_CAP_MIB} MiB；本�
 限制：TCP 缓存不是速率限制器；不能仅靠 iperf3 认定运营商 QoS、随机丢包或 PMTU 故障。
 结论：仅为本次已测试候选的最优结果，不保证全局最优；未达标仍应用最佳有效候选。
 EOF_RULES
-  cat "$RULES_FILE"
+  info "本次参数记录：$RULES_FILE"
 }
 
 apply_sysctl_content() {
@@ -818,12 +874,12 @@ ExecStart=/usr/local/sbin/bbr-tcp-qdisc
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
-  if have systemctl; then
+  if systemd_available; then
     systemctl daemon-reload
     systemctl enable bbr-tcp-tuning.service >/dev/null
     systemctl restart bbr-tcp-tuning.service
   else
-    warn "系统没有 systemd：sysctl 配置已保存，但 ${TUNING_QDISC} qdisc 需要自行设置开机任务"
+    warn "当前未运行 systemd：sysctl 配置已保存，但 ${TUNING_QDISC} qdisc 需要自行设置开机任务"
   fi
 }
 
@@ -847,7 +903,7 @@ create_backup() {
   backup_file "$backup" "$ENV_FILE" env
   backup_file "$backup" "$QDISC_HELPER" helper
   backup_file "$backup" "$SERVICE_FILE" service
-  if have systemctl; then
+  if systemd_available; then
     service_enabled="$(systemctl is-enabled bbr-tcp-tuning.service 2>/dev/null || true)"
     service_active="$(systemctl is-active bbr-tcp-tuning.service 2>/dev/null || true)"
   fi
@@ -879,100 +935,131 @@ restore_files() {
   while IFS=$'\t' read -r tag state path; do
     [[ -n "$tag" && -n "$path" ]] || continue
     if [[ "$state" == "present" ]]; then
-      rm -f "$path"
-      cp -a "${backup}/${tag}.file" "$path"
+      [[ -e "${backup}/${tag}.file" || -L "${backup}/${tag}.file" ]] || { error "缺少文件备份：${backup}/${tag}.file"; return 1; }
+      rm -f "$path" || return 1
+      cp -a "${backup}/${tag}.file" "$path" || return 1
     else
-      rm -f "$path"
+      rm -f "$path" || return 1
     fi
   done <"${backup}/files.tsv"
 }
 
 restore_qdisc() {
   local backup="$1" iface="$2" kind="$3" parent leaf handle
+  case "$kind" in
+    ""|noqueue|pfifo_fast|mq|fq|fq_codel|sfq|cake) ;;
+    *) error "原 qdisc ${kind} 无法自动重建；当前队列保持不动，请参考 ${backup}/qdisc.txt"; return 1 ;;
+  esac
+  if [[ "$kind" == mq ]]; then
+    while read -r leaf; do
+      case "$leaf" in fq|fq_codel|pfifo_fast|sfq|cake) ;;
+        *) error "mq 子队列 ${leaf} 无法完整恢复，请按备份手工处理"; return 1 ;;
+      esac
+    done < <(awk '/ parent / {print $2}' "${backup}/qdisc.txt")
+  fi
   tc qdisc del dev "$iface" root 2>/dev/null || true
   case "$kind" in
-    ""|noqueue|pfifo_fast) ;;
+    ""|noqueue) ;;
+    pfifo_fast) tc qdisc replace dev "$iface" root pfifo_fast 2>/dev/null || return 1 ;;
     mq)
       handle="$(awk '$0~/[[:space:]]root([[:space:]]|$)/{print $3; exit}' "${backup}/qdisc.txt")"
       if [[ "$handle" =~ ^[[:xdigit:]]+:$ && "$handle" != "0:" ]]; then
-        tc qdisc replace dev "$iface" root handle "$handle" mq 2>/dev/null || return 0
+        tc qdisc replace dev "$iface" root handle "$handle" mq 2>/dev/null || return 1
       else
-        tc qdisc replace dev "$iface" root mq 2>/dev/null || return 0
+        tc qdisc replace dev "$iface" root mq 2>/dev/null || return 1
       fi
       while read -r leaf parent; do
-        case "$leaf" in fq|fq_codel|pfifo_fast|sfq|cake) tc qdisc replace dev "$iface" parent "$parent" "$leaf" 2>/dev/null || true ;; esac
+        case "$leaf" in fq|fq_codel|pfifo_fast|sfq|cake) tc qdisc replace dev "$iface" parent "$parent" "$leaf" 2>/dev/null || return 1 ;; esac
       done < <(awk '{kind=$2; parent=""; for(i=1;i<=NF;i++) if($i=="parent")parent=$(i+1); if(parent~/^[[:xdigit:]]*:[[:xdigit:]]+$/)print kind,parent}' "${backup}/qdisc.txt")
       ;;
-    fq|fq_codel|sfq|cake) tc qdisc replace dev "$iface" root "$kind" 2>/dev/null || true ;;
-    *) warn "原 qdisc ${kind} 无法完整自动重建，请参考 ${backup}/qdisc.txt" ;;
+    fq|fq_codel|sfq|cake) tc qdisc replace dev "$iface" root "$kind" 2>/dev/null || return 1 ;;
+    *) error "原 qdisc ${kind} 无法完整自动重建，请参考 ${backup}/qdisc.txt"; return 1 ;;
   esac
 }
 
 restore_backup() {
-  local backup="$1" iface="" kind="" key value
+  local backup="$1" iface="" kind="" key value after failed=0
   local IFACE="" ROOT_QDISC="" ROOT_QDISC_KIND="" SERVICE_ENABLED="unknown" SERVICE_ACTIVE="unknown"
-  # shellcheck disable=SC1090
-  source "${backup}/meta.env"
+  [[ -r "${backup}/meta.env" && -r "${backup}/sysctl.tsv" && -r "${backup}/files.tsv" ]] || {
+    error "备份文件不完整：$backup"; return 1;
+  }
+  source "${backup}/meta.env" || return 1
   iface="$IFACE"; kind="${ROOT_QDISC:-$ROOT_QDISC_KIND}"
-  if have systemctl; then systemctl disable --now bbr-tcp-tuning.service >/dev/null 2>&1 || true; fi
-  restore_files "$backup"
+  if systemd_available; then systemctl disable --now bbr-tcp-tuning.service >/dev/null 2>&1 || true; fi
+  restore_files "$backup" || failed=1
   while IFS=$'\t' read -r key value; do
-    [[ -n "$key" ]] && sysctl -w "${key}=${value}" >/dev/null 2>&1 || true
+    [[ -n "$key" ]] || continue
+    if ! sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+      error "恢复失败：${key}"; failed=1; continue
+    fi
+    after="$(sysctl_get "$key")"
+    if [[ "$(awk '{$1=$1;print}' <<<"$after")" != "$(awk '{$1=$1;print}' <<<"$value")" ]]; then
+      error "恢复读回不一致：${key}"; failed=1
+    fi
   done <"${backup}/sysctl.tsv"
-  restore_qdisc "$backup" "$iface" "$kind"
-  if have systemctl; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
+  restore_qdisc "$backup" "$iface" "$kind" || { error "队列恢复失败：${iface}，详见 ${backup}/qdisc.txt"; failed=1; }
+  if systemd_available; then
+    systemctl daemon-reload >/dev/null 2>&1 || failed=1
     if [[ -f "$SERVICE_FILE" ]]; then
       if [[ "$SERVICE_ENABLED" == "enabled" ]]; then
-        systemctl enable bbr-tcp-tuning.service >/dev/null 2>&1 || true
+        systemctl enable bbr-tcp-tuning.service >/dev/null 2>&1 || failed=1
       else
-        systemctl disable bbr-tcp-tuning.service >/dev/null 2>&1 || true
+        systemctl disable bbr-tcp-tuning.service >/dev/null 2>&1 || failed=1
       fi
       if [[ "$SERVICE_ACTIVE" == "active" ]]; then
-        systemctl start bbr-tcp-tuning.service >/dev/null 2>&1 || true
+        systemctl start bbr-tcp-tuning.service >/dev/null 2>&1 || failed=1
       fi
     fi
   fi
-  return 0
+  (( failed == 0 )) || { error "未能完整恢复；请检查备份和日志后重试：$backup"; return 1; }
 }
 
 pending_path() { printf '%s/%s\n' "$PENDING_DIR" "$(basename "$1")"; }
 
 schedule_rollback() {
-  local backup="$1" pending unit pid
+  local backup="$1" pending unit pid token runner started
   (( AUTO_ROLLBACK_SECONDS > 0 )) || return 0
   pending="$(pending_path "$backup")"
   mkdir -p "$pending"
   printf '%s\n' "$backup" >"${pending}/backup"
-  : >"${pending}/armed"
-  if have systemd-run && have systemctl && systemctl is-system-running >/dev/null 2>&1; then
-    unit="bbr-tcp-rollback-$(date +%s)-$$"
+  token="$(date +%s)-$$-${RANDOM}-${RANDOM}"
+  printf '%s\n' "$token" >"${pending}/armed"
+  runner="${backup}/rollback-runner.sh"
+  [[ -s "$runner" ]] || cp "$SCRIPT_PATH" "$runner"
+  chmod 0700 "$runner"
+  rm -f "${pending}/owner"
+  if [[ "$TUNING_ACTIVE" == 1 ]]; then
+    started="$(process_start_id "$$" || true)"
+    [[ -z "$started" ]] || printf '%s %s\n' "$$" "$started" >"${pending}/owner"
+  fi
+  if have systemd-run && systemd_available; then
+    unit="bbr-tcp-rollback-${token}"
     systemd-run --quiet --unit "$unit" --on-active="${AUTO_ROLLBACK_SECONDS}s" \
-      /usr/bin/env BBR_AUTO_ROLLBACK=1 /bin/bash "$SCRIPT_PATH" rollback --backup "$backup" --yes
+      /usr/bin/env BBR_AUTO_ROLLBACK=1 "BBR_ROLLBACK_TOKEN=$token" /bin/bash "$runner" rollback --backup "$backup" --yes
     printf 'TYPE=systemd\nID=%q\n' "$unit" >"${pending}/timer.env"
   else
     nohup /bin/bash -c '
       sleep "$1"; [[ -f "$2" ]] || exit 0
-      BBR_AUTO_ROLLBACK=1 /bin/bash "$3" rollback --backup "$4" --yes >>"$5" 2>&1
-    ' _ "$AUTO_ROLLBACK_SECONDS" "${pending}/armed" "$SCRIPT_PATH" "$backup" "${pending}/rollback.log" >/dev/null 2>&1 &
+      BBR_AUTO_ROLLBACK=1 BBR_ROLLBACK_TOKEN="$6" /bin/bash "$3" rollback --backup "$4" --yes >>"$5" 2>&1
+    ' _ "$AUTO_ROLLBACK_SECONDS" "${pending}/armed" "$runner" "$backup" "${backup}/rollback.log" "$token" 8>&- >/dev/null 2>&1 &
     pid=$!
-    printf 'TYPE=process\nID=%q\n' "$pid" >"${pending}/timer.env"
+    printf 'TYPE=process\nID=%q\nSTART=%q\n' "$pid" "$(process_start_id "$pid" || true)" >"${pending}/timer.env"
   fi
   ln -sfn "$pending" "$PENDING_LATEST"
   warn "已启用 ${AUTO_ROLLBACK_SECONDS} 秒安全回滚；确认服务器正常后执行 sudo $PROGRAM confirm"
 }
 
 cancel_pending_dir() {
-  local pending="$1" type="" id="" recorded real
+  local pending="$1" type="" id="" recorded real started="" actual=""
   if [[ ! -d "$pending" ]]; then
     [[ -L "$PENDING_LATEST" ]] && rm -f "$PENDING_LATEST"
     return 0
   fi
   if [[ -r "${pending}/timer.env" ]]; then
-    local TYPE="" ID=""
+    local TYPE="" ID="" START=""
     # shellcheck disable=SC1090
     source "${pending}/timer.env"
-    type="$TYPE"; id="$ID"
+    type="$TYPE"; id="$ID"; started="$START"
   fi
   rm -f "${pending}/armed"
   if [[ "${BBR_AUTO_ROLLBACK:-0}" != "1" ]]; then
@@ -980,8 +1067,11 @@ cancel_pending_dir() {
       systemd) systemctl stop "${id}.timer" "${id}.service" >/dev/null 2>&1 || true ;;
       process)
         if [[ "$id" =~ ^[0-9]+$ ]]; then
-          kill "$id" 2>/dev/null || true
-          wait "$id" 2>/dev/null || true
+          actual="$(process_start_id "$id" || true)"
+          if [[ -n "$started" && "$actual" == "$started" ]] || jobs -p | grep -Fxq "$id"; then
+            kill "$id" 2>/dev/null || true
+            wait "$id" 2>/dev/null || true
+          fi
         fi
         ;;
     esac
@@ -1054,9 +1144,18 @@ rollback_command() {
   elif (( ! YES )); then
     die "非交互回滚需要 --yes"
   fi
-  cancel_rollback_for_backup "$backup"
-  restore_backup "$backup"
-  info "服务器 TCP/BBR 参数已恢复：$backup"
+  if [[ "${BBR_AUTO_ROLLBACK:-0}" == 1 ]]; then
+    local pending token
+    pending="$(pending_path "$backup")"
+    token="$(cat "${pending}/armed" 2>/dev/null || true)"
+    [[ -n "${BBR_ROLLBACK_TOKEN:-}" && "$token" == "$BBR_ROLLBACK_TOKEN" ]] || { info "本次定时回滚已取消或更新，跳过"; return 0; }
+  fi
+  if restore_backup "$backup"; then
+    cancel_rollback_for_backup "$backup"
+    info "服务器 TCP/BBR 参数已恢复：$backup"
+  else
+    die "回滚未完整完成；备份已保留，请检查 ${backup} 后重试"
+  fi
 }
 
 capture_state() {
@@ -1097,7 +1196,8 @@ init_session() {
   REPORT_FILE="${SESSION_DIR}/results.tsv"
   COMPARISON_FILE="${SESSION_DIR}/comparison.txt"
   : >"$RUN_LOG"
-  exec > >(tee -a "$RUN_LOG") 2>&1
+  exec > >(tee -a "$RUN_LOG" 8>&-) 2>&1
+  ui_init
   printf 'stage\tround\tmode\tconfig\tstreams\tbuffer_mib\tbdp_ratio\trtt_ms\tmbps\tretrans\tretrans_percent\tmetric_score\tpassed\tbalance_score\teligible\tstrategy\tcv_percent\tmeasured_rtt_ms\trepeats\n' >"$REPORT_FILE"
 }
 
@@ -1521,7 +1621,7 @@ run_reverse_test() {
   rtt_file="${SESSION_DIR}/${label}.rtt-samples"
   port_is_free "$TEST_PORT" || die "测试端口 ${TEST_PORT} 已被占用"
   : >"$json_file"; : >"$err_file"; : >"$rtt_file"
-  iperf_server_loop "$json_file" "$err_file" "$TEST_PORT" "$IPERF_FAMILY" "$streams" "$DURATION" &
+  iperf_server_loop "$json_file" "$err_file" "$TEST_PORT" "$IPERF_FAMILY" "$streams" "$DURATION" 8>&- &
   CURRENT_TEST_PID=$!
   if ! wait_for_iperf_listener "$TEST_PORT" "$CURRENT_TEST_PID"; then
     kill "$CURRENT_TEST_PID" 2>/dev/null || true
@@ -1534,7 +1634,7 @@ run_reverse_test() {
   section "${display_label}｜${streams} 个 TCP 流｜端口 ${TEST_PORT}"
   printf '服务器监听状态：已确认 TCP %s 正在监听。\n' "$TEST_PORT"
   printf '本地只需执行下面一条命令（不会修改本地 TCP 参数）：\n\n'
-  printf '  iperf3 %s -c %s -p %s -R -P %s -t %s -i 1\n\n' "$IPERF_FAMILY" "$address" "$TEST_PORT" "$streams" "$DURATION"
+  printf '  iperf3 %s -c %q -p %s -R -P %s -t %s -i 1\n\n' "$IPERF_FAMILY" "$address" "$TEST_PORT" "$streams" "$DURATION"
   printf '等待规则：最多等待连接 %s 秒；开始传输后约运行 %s 秒。\n' "$WAIT_SECONDS" "$DURATION"
   printf '未完成的连接会自动恢复监听；完整结果若校验异常则停止本轮并保留诊断，不反复要求重测。\n'
   printf '如仍提示连接被拒绝，请确认安全组和服务器防火墙允许 TCP %s。\n' "$TEST_PORT"
@@ -1603,7 +1703,7 @@ run_reverse_test() {
   printf '  是否达到目标：%s\n\n' "$(format_pass "$RESULT_PASS")"
 }
 abort_without_changes() {
-  trap - INT TERM
+  trap - INT TERM HUP
   set +e
   [[ -n "$CURRENT_TEST_PID" ]] && kill "$CURRENT_TEST_PID" 2>/dev/null || true
   warn "测试已中断；尚未修改服务器 TCP 参数"
@@ -1612,20 +1712,28 @@ abort_without_changes() {
 
 cleanup_tuning_on_exit() {
   local rc=$?
-  trap - EXIT ERR INT TERM
+  trap - EXIT ERR INT TERM HUP
+  if [[ -n "$CURRENT_TEST_PID" ]]; then
+    kill "$CURRENT_TEST_PID" 2>/dev/null || true
+    wait "$CURRENT_TEST_PID" 2>/dev/null || true
+    CURRENT_TEST_PID=""
+  fi
   if (( rc != 0 )) && [[ "$TUNING_ACTIVE" == "1" && -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
     set +e
     [[ -n "$CURRENT_TEST_PID" ]] && kill "$CURRENT_TEST_PID" 2>/dev/null || true
     warn "调优异常退出，正在恢复调优前参数"
-    cancel_rollback_for_backup "$BACKUP_DIR"
-    restore_backup "$BACKUP_DIR"
+    if restore_backup "$BACKUP_DIR"; then
+      cancel_rollback_for_backup "$BACKUP_DIR"
+    else
+      error "自动恢复未完整完成；请使用备份重试：${BACKUP_DIR}"
+    fi
     TUNING_ACTIVE="0"
   fi
   exit "$rc"
 }
 
 stop_tuning_on_signal() {
-  trap - INT TERM
+  trap - INT TERM HUP
   set +e
   [[ -n "$CURRENT_TEST_PID" ]] && kill "$CURRENT_TEST_PID" 2>/dev/null || true
   warn "收到中断信号，准备恢复调优前参数"
@@ -1699,6 +1807,7 @@ TCP/BBR 参数优化评估报告
 ----------------------------------------------------------------
 处置结果：
   ${disposition}
+  请在确认窗口内执行 bbr-tune confirm，否则会恢复备份。
 
 综合判定：
   ${assessment}
@@ -1714,7 +1823,7 @@ TCP/BBR 参数优化评估报告
 联合模型：单连接与 ${BALANCE_MULTI_STREAMS} 连接场景等权评估，吞吐使用调和均值，波动/重传取较差侧
 重复测量：每种连接数 ${TEST_REPEATS} 次；吞吐、RTT、估算重传比例取中位数
 稳定性指标：区间吞吐 CV 与重复测量 CV 取较大值；结合负载 RTT 相对对应基线的增长
-吞吐口径：优先接收端统计；反向服务端的接收占位记录回退为发送端速率，具体来源保留在 measurements.tsv
+吞吐口径：优先接收端统计；反向服务端的接收占位记录回退为发送端速率，具体来源保留在各轮 *.measurements.tsv
 数据限制：NA 表示缺失而非零；稳定优先缺失区间数据时拒绝选优；重传比例是估算值，不是实际丢包率
 保护条件：单连接和多连接吞吐均不得低于对应基线的 ${BALANCE_MIN_RETENTION_PERCENT}%
 选择原则：优先选择满足单/多连接保护线的候选，再按综合评分排序；未达到绝对目标时仍采用实测最优候选
@@ -1891,7 +2000,13 @@ EOF_COMPARE
     printf '完整参数对比数据：\n  %s/sysctl-comparison.tsv\n' "$SESSION_DIR"
     printf '决策依据：\n  %s/rules.txt\n' "$SESSION_DIR"
   } >>"$COMPARISON_FILE"
-  cat "$COMPARISON_FILE"
+  section "调优结果 / 单连接与多连接对比"
+  printf '  单连接吞吐  %s → %s Mbps（%s%%）\n' "$BASELINE_SINGLE_MBPS" "$FINAL_SINGLE_MBPS" "$single_delta"
+  printf '  多连接吞吐  %s → %s Mbps（%s%%）\n' "$BASELINE_MULTI_MBPS" "$FINAL_MULTI_MBPS" "$multi_delta"
+  printf '  单连接估算重传率  %s%% → %s%%\n' "$BASELINE_SINGLE_RETRANS_PERCENT" "$FINAL_SINGLE_RETRANS_PERCENT"
+  printf '  多连接估算重传率  %s%% → %s%%\n' "$BASELINE_MULTI_RETRANS_PERCENT" "$FINAL_MULTI_RETRANS_PERCENT"
+  printf '\n  评估：%s\n  处置：%s\n' "$assessment" "$disposition"
+  printf '\n  完整报告：%s\n' "$COMPARISON_FILE"
 }
 append_history() {
   local expected_header current_header legacy_file single_delta multi_delta
@@ -1922,7 +2037,6 @@ append_history() {
 autotune() {
   require_linux; require_root; validate_autotune_options
   for cmd in ip tc sysctl modprobe awk mktemp ss tee; do have "$cmd" || die "服务器缺少命令：$cmd"; done
-  pending_guard
   init_session
   install_iperf3_if_needed
   install_python3_if_needed
@@ -1977,7 +2091,8 @@ autotune() {
   printf '  日志目录：%s\n\n' "$SESSION_DIR"
   warn "请确认云安全组和服务器防火墙允许 TCP ${TEST_PORT}；本工具不会修改本地电脑"
 
-  trap abort_without_changes INT TERM
+  trap abort_without_changes INT TERM HUP
+  trap cleanup_tuning_on_exit EXIT
   section "调优前基线：单连接与多连接"
   run_balanced_pair "before" "$address" "调优前基线" no
   [[ -n "$RTT_MS" ]] || die "无法自动取得本地与服务器之间的 RTT；请检查 iperf3 JSON、ss 或客户端 ICMP 可达性"
@@ -2015,11 +2130,11 @@ autotune() {
     "$TCP_MEM_LOW_PAGES" "$TCP_MEM_PRESSURE_PAGES" "$TCP_MEM_HIGH_PAGES"
   printf '  搜索策略：倍增探索；检测到综合评分回落后，二分回退至 1 MiB 粒度\n\n'
 
-  trap - INT TERM
   BACKUP_DIR="$(create_backup "$iface")"
   TUNING_ACTIVE="1"
   trap cleanup_tuning_on_exit EXIT
-  trap stop_tuning_on_signal INT TERM
+  trap stop_tuning_on_signal INT TERM HUP
+  pending_guard
   schedule_rollback "$BACKUP_DIR"
 
   section "第一阶段：倍增探索综合性能边界"
@@ -2082,7 +2197,7 @@ autotune() {
     cancel_rollback_for_backup "$BACKUP_DIR"
     restore_backup "$BACKUP_DIR"
     TUNING_ACTIVE="0"
-    trap - INT TERM
+    trap - INT TERM HUP
     die "未取得任何有效候选测试结果，已恢复调优前配置"
   fi
 
@@ -2107,7 +2222,7 @@ autotune() {
       OUTCOME="best-effort-persistent"
     fi
   fi
-  trap - INT TERM
+  trap - INT TERM HUP
   if (( AUTO_ROLLBACK_SECONDS > 0 )); then
     warn "实测最优参数已生效；请在 ${AUTO_ROLLBACK_SECONDS} 秒内通过独立 SSH 会话验证，然后执行 sudo $PROGRAM confirm"
   else
@@ -2117,6 +2232,7 @@ autotune() {
   if (( AUTO_ROLLBACK_SECONDS > 0 )); then
     cancel_rollback_for_backup "$BACKUP_DIR"
     schedule_rollback "$BACKUP_DIR"
+    rm -f "$(pending_path "$BACKUP_DIR")/owner"
   fi
   capture_state "$iface" "${SESSION_DIR}/system-after.txt"
   write_comparison "$iface" "$FINAL_BUFFER_BYTES"
@@ -2163,30 +2279,29 @@ status_command() {
 }
 history_command() {
   local header
-  if [[ ! -r "$HISTORY_FILE" ]]; then
-    info "尚无历史测试记录"
-    return
-  fi
+  if [[ ! -r "$HISTORY_FILE" ]]; then info "尚无历史测试记录；完成一次调优后即可在此对比"; return; fi
   IFS= read -r header <"$HISTORY_FILE" || header=""
-  section "TCP/BBR 历史测试"
+  section "历史测试 / 按时间归档"
   if [[ "$header" == *$'before_single_mbps\tafter_single_mbps'* ]]; then
-    printf '| 时间 | 会话 | RTT ms | 单连接 前→后 | 单连接变化 | 多连接 前→后 | 多连接变化 | 缓存 MiB | 结果 | 方案 |\n'
-    printf '|---|---|---:|---:|---:|---:|---:|---:|---|---|\n'
-    awk -F '\t' 'NR>1 {printf "| %s | %s | %s | %s→%s | %s%% | %s→%s | %s%% | %s | %s | %s |\n",$1,$2,$4,$6,$7,$8,$9,$10,$11,$18,$19,($21==""?"legacy":$21)}' "$HISTORY_FILE"
-  elif [[ "$header" == *$'before_mbps\tafter_mbps'* ]]; then
-    warn "当前为旧版历史字段；下一次调优会保留旧文件并创建新版联合评估记录"
-    printf '| 时间 | 会话 | 目标 Mbps | RTT ms | 原并发 | 调优前 Mbps | 调优后 Mbps | 变化 | 缓存 MiB | 结果 |\n'
-    printf '|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n'
-    awk -F '\t' 'NR>1 {printf "| %s | %s | %s | %s | %s | %s | %s | %s%% | %s | %s |\n",$1,$2,$3,$4,$5,$6,$7,$8,$11,$12}' "$HISTORY_FILE"
+    awk -F '\t' '
+      function strategy(s) {if(s=="speed")return "速度优先";if(s=="stable")return "稳定优先";if(s=="retrans")return "低重传优先";return "均衡"}
+      NR>1 {
+        printf "\n  %s  /  %s\n", $1,strategy($21)
+        printf "  会话：%s\n",$2
+        printf "  单连接：%s → %s Mbps（%s%%）\n",$6,$7,$8
+        printf "  多连接：%s → %s Mbps（%s%%）\n",$9,$10,$11
+        printf "  RTT：%s ms    缓存：%s MiB\n",$4,$18
+        printf "  测试结论：%s\n",($19~/^optimized-/ ? "达到目标" : "最佳努力，未完全达标")
+        printf "  报告：%s\n",$20
+      }' "$HISTORY_FILE"
+    printf '\n  历史结论仅反映当时测试；当前生效参数请查看“当前状态”。\n'
   else
-    warn "无法识别历史记录字段，以下输出保留原始内容"
-    cat "$HISTORY_FILE"
+    warn "这是旧版历史记录；请按首行字段查看原文件：$HISTORY_FILE"
   fi
-  printf '\n完整历史数据：%s\n' "$HISTORY_FILE"
-  printf '每个会话的日志目录：%s\n' "$SESSION_ROOT"
 }
+
 ui_init() {
-  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR+x}" ]]; then
     UI_BLUE=$'\033[1;36m'; UI_GREEN=$'\033[1;32m'; UI_YELLOW=$'\033[1;33m'; UI_RED=$'\033[1;31m'; UI_RESET=$'\033[0m'
   else
     UI_BLUE=""; UI_GREEN=""; UI_YELLOW=""; UI_RED=""; UI_RESET=""
@@ -2194,10 +2309,27 @@ ui_init() {
 }
 
 ui_title() {
-  clear 2>/dev/null || true
-  printf '%s╔══════════════════════════════════════════════════════════════╗%s\n' "$UI_BLUE" "$UI_RESET"
-  printf '%s║        远程服务器 TCP / BBR 自动寻优工具 v%-10s       ║%s\n' "$UI_BLUE" "$VERSION" "$UI_RESET"
-  printf '%s╚══════════════════════════════════════════════════════════════╝%s\n\n' "$UI_BLUE" "$UI_RESET"
+  section "BBR TUNE  /  远程服务器网络调优"
+  printf '  版本 %s    服务器 → 本地电脑\n' "$VERSION"
+  printf '  仅修改服务器参数；本地只测速。\n'
+  if [[ -f "${PENDING_LATEST}/armed" ]]; then
+    printf '\n  %s[待确认]%s 当前参数仍受安全回滚保护，请验证后选择 4。\n' "$UI_YELLOW" "$UI_RESET"
+  fi
+  printf '\n'
+}
+
+ui_menu_options() {
+  printf '  调优与记录\n'
+  printf '    %s1%s  自动测试并选择 TCP 参数\n' "$UI_GREEN" "$UI_RESET"
+  printf '    2  查看当前 TCP / BBR 状态\n'
+  printf '    3  查看历史测试与对比\n'
+  printf '\n  参数管理\n'
+  printf '    4  确认保留当前参数\n'
+  printf '    5  恢复调优前参数\n'
+  printf '\n  工具\n'
+  printf '    6  使用说明\n'
+  printf '    7  BBRv3 内核管理\n'
+  printf '    0  退出\n\n'
 }
 
 ui_read_text() {
@@ -2207,9 +2339,12 @@ ui_read_text() {
 }
 
 ui_read_number() {
-  local label="$1" default="$2" min="$3" max="$4" value
+  local label="$1" default="$2" min="$3" max="$4" kind="${5:-number}" value
   while true; do
     value="$(ui_read_text "$label" "$default")" || return 1
+    if [[ "$kind" == integer ]] && ! is_integer "$value"; then
+      printf '请输入 %s～%s 的整数\n' "$min" "$max" >&2; continue
+    fi
     if is_number "$value" && awk -v v="$value" -v lo="$min" -v hi="$max" 'BEGIN {exit !(v>=lo && v<=hi)}'; then
       printf '%s\n' "$value"; return 0
     fi
@@ -2230,9 +2365,7 @@ ui_yes_no() {
 ui_execute() {
   local need_root="$1"; shift
   local cmd=(bash "$SCRIPT_PATH" "$@") rc
-  printf '\n%s执行：%s' "$UI_BLUE" "$UI_RESET"
-  printf ' %q' "${cmd[@]}"
-  printf '\n\n'
+  section "执行操作"
   if [[ "$need_root" == "1" && $EUID -ne 0 ]]; then
     have sudo || { printf '%s需要 root，但未安装 sudo%s\n' "$UI_RED" "$UI_RESET"; return 1; }
     if sudo "${cmd[@]}"; then rc=0; else rc=$?; fi
@@ -2240,9 +2373,9 @@ ui_execute() {
     if "${cmd[@]}"; then rc=0; else rc=$?; fi
   fi
   if (( rc == 0 )); then
-    printf '\n%s✓ 操作完成%s\n' "$UI_GREEN" "$UI_RESET"
+    printf '\n%s[完成] 操作已结束%s\n' "$UI_GREEN" "$UI_RESET"
   else
-    printf '\n%s✗ 操作失败，退出码 %s%s\n' "$UI_RED" "$rc" "$UI_RESET"
+    printf '\n%s[未完成] 请按上方错误说明处理；退出码 %s%s\n' "$UI_RED" "$rc" "$UI_RESET"
   fi
   return "$rc"
 }
@@ -2276,15 +2409,17 @@ ui_autotune() {
   bandwidth="$(ui_read_number "期望端到端下载带宽 Mbps" "1000" "1" "100000")" || return
   address="$(ui_read_text "服务器公网 IP 或域名" "$address")" || return
   [[ -n "$address" ]] || { printf '%s服务器地址不能为空%s\n' "$UI_RED" "$UI_RESET"; return; }
-  streams="$(ui_read_number "多连接评估并发流" "8" "2" "64")" || return
-  duration="$(ui_read_number "每轮测试秒数" "15" "5" "300")" || return
+  streams="$(ui_read_number "多连接评估并发流" "8" "2" "64" integer)" || return
+  duration="$(ui_read_number "每轮测试秒数" "15" "5" "300" integer)" || return
   util="$(ui_read_number "目标带宽利用率 %" "90" "1" "100")" || return
   retrans="$(ui_read_number "最大估算重传率 %" "1" "0" "100")" || return
   if ui_yes_no "最优参数通过复测后写入开机配置" "n"; then args+=(--persist); fi
-  printf '\n%s自动规则%s\n' "$UI_YELLOW" "$UI_RESET"
+  local selected_name
+  case "$strategy" in balanced) selected_name="均衡" ;; speed) selected_name="速度优先" ;; stable) selected_name="稳定优先" ;; retrans) selected_name="低重传优先" ;; esac
+  section "开始前确认"
   printf '  • RTT 由首轮 iperf3 自动测量。\n'
   printf '  • 每组参数依次执行单连接和 %s 连接测试，以所选方案评分选优。\n' "$streams"
-  printf '  • 方案：%s；每种连接数默认复测 2 次，按中位数评价。\n' "$strategy"
+  printf '  • 方案：%s；每种连接数默认复测 2 次，按中位数评价。\n' "$selected_name"
   printf '  • 扩容受 BDP/内存约束；连续两档无收益停止，回落则回退精调。\n'
   printf '  • 不改内核故障处理、VM、ARP、路由和连接超时策略。\n'
   printf '  • TCP 聚合缓存高水位按服务器有效总内存的 2/3 计算。\n'
@@ -2312,21 +2447,14 @@ menu() {
   local choice
   while true; do
     ui_title
-    printf '  %s1)%s 自动测试并选择最优 TCP 参数\n' "$UI_GREEN" "$UI_RESET"
-    printf '  2) 查看当前 TCP / BBR 状态\n'
-    printf '  3) 查看历史测试与对比记录\n'
-    printf '  4) 确认保留当前参数\n'
-    printf '  5) 恢复调优前参数\n'
-    printf '  6) 使用说明\n'
-    printf '  7) BBRv3 内核管理（第三方标准版 Release，不自动重启）\n'
-    printf '  0) 退出\n\n'
+    ui_menu_options
     read -r -p "请选择：" choice || return
     case "$choice" in
       1) ui_autotune || true ;;
       2) ui_execute 0 status --iface "$IFACE" || true ;;
       3) ui_execute 0 history || true ;;
       4) ui_execute 1 confirm || true ;;
-      5) ui_execute 1 rollback --yes || true ;;
+      5) ui_execute 1 rollback || true ;;
       6) usage ;;
       7) ui_execute 1 kernel menu || true ;;
       0) return ;;
@@ -2338,6 +2466,12 @@ menu() {
 
 main() {
   parse_args "$@"
+  ui_init
+  if [[ "$COMMAND" == rollback && "${BBR_AUTO_ROLLBACK:-0}" == 1 ]]; then
+    require_linux; require_root
+    stop_expired_session
+  fi
+  case "$COMMAND" in autotune|confirm|rollback) acquire_operation_lock ;; esac
   case "$COMMAND" in
     menu) menu ;;
     autotune) autotune ;;

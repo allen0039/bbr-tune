@@ -53,7 +53,7 @@ require_linux_root() {
 
 missing_runtime_commands() {
   local cmd missing=()
-  for cmd in bash ip tc ss sysctl modprobe awk mktemp tee install grep head cp ln mkdir rm dirname uname; do
+  for cmd in bash ip tc ss sysctl modprobe flock awk mktemp tee install grep head cp ln mkdir rm dirname uname; do
     have "$cmd" || missing+=("$cmd")
   done
   printf '%s\n' "${missing[@]:-}"
@@ -70,17 +70,17 @@ install_runtime_dependencies() {
   if have apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y bash iproute2 procps kmod coreutils grep gawk ca-certificates curl
+    apt-get install -y bash iproute2 procps kmod coreutils grep gawk util-linux ca-certificates curl
   elif have dnf; then
-    dnf install -y bash iproute procps-ng kmod coreutils grep gawk ca-certificates curl
+    dnf install -y bash iproute procps-ng kmod coreutils grep gawk util-linux ca-certificates curl
   elif have yum; then
-    yum install -y bash iproute procps-ng kmod coreutils grep gawk ca-certificates curl
+    yum install -y bash iproute procps-ng kmod coreutils grep gawk util-linux ca-certificates curl
   elif have zypper; then
-    zypper --non-interactive install bash iproute2 procps kmod coreutils grep gawk ca-certificates curl
+    zypper --non-interactive install bash iproute2 procps kmod coreutils grep gawk util-linux ca-certificates curl
   elif have apk; then
-    apk add --no-cache bash iproute2 procps-ng kmod coreutils grep gawk ca-certificates curl
+    apk add --no-cache bash iproute2 procps-ng kmod coreutils grep gawk util-linux ca-certificates curl
   elif have pacman; then
-    pacman -Sy --needed --noconfirm bash iproute2 procps-ng kmod coreutils grep gawk ca-certificates curl
+    pacman -Sy --needed --noconfirm bash iproute2 procps-ng kmod coreutils grep gawk util-linux ca-certificates curl
   else
     die "无法识别服务器包管理器，请先安装：bash、iproute2、procps、kmod、coreutils、awk"
   fi
@@ -143,11 +143,25 @@ launch_tool() {
   fi
 }
 
+acquire_install_lock() {
+  local pending=/var/lib/bbr-tcp-tuning/pending-latest backup
+  have flock || die "缺少 flock，无法安全更新"
+  umask 077
+  mkdir -p /var/lib/bbr-tcp-tuning
+  exec 8>/var/lib/bbr-tcp-tuning/operation.lock
+  flock -n 8 || die "调优或内核操作正在运行，请结束后再更新"
+  if [[ -f "${pending}/armed" ]]; then
+    backup="$(cat "${pending}/backup" 2>/dev/null || true)"
+    [[ -n "$backup" && -s "${backup}/rollback-runner.sh" ]] || die "旧版调优仍待确认，请先执行 bbr-tune confirm 或 rollback，再更新"
+  fi
+}
+
 main() {
   local source_file=""
   parse_args "$@"
   require_linux_root
   install_runtime_dependencies
+  acquire_install_lock
 
   TEMP_FILE="$(mktemp /tmp/bbr-tune.XXXXXX)"
   TEMP_KERNEL_FILE="$(mktemp /tmp/bbr-kernel.XXXXXX)"
@@ -170,6 +184,8 @@ main() {
   cleanup
   TEMP_FILE=""; TEMP_KERNEL_FILE=""
   trap - EXIT
+  flock -u 8
+  exec 8>&-
   if (( LAUNCH_AFTER_INSTALL )); then launch_tool; fi
 }
 

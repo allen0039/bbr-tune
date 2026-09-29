@@ -28,6 +28,7 @@ fi
 (
   INSTALL_PATH="$tmp/only/sbin/bbr-tune"; LINK_PATH="$tmp/only/bin/bbr-tune"
   require_linux_root() { :; }; install_runtime_dependencies() { :; }
+  acquire_install_lock() { :; }; flock() { :; }
   launch_tool() { fail 'install-only launched menu'; }
   main --install-only >/dev/null
 ) || fail "install-only exit status"

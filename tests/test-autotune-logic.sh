@@ -251,6 +251,7 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   schedule_rollback() { renewals=$((renewals+1)); }
   restore_backup() { restores=$((restores+1)); }
   sysctl_exists() { local key; for key in "${TUNING_SYSCTL_KEYS[@]}"; do [[ "$1" == "$key" ]] && return 0; done; return 1; }
+  systemd_available() { return 0; }
   systemctl() { printf '%s\n' "$*" >>"$sim/systemctl.log"; }
   apply_candidate() { printf '%s\n' "$2" >>"$sim/applied.log"; }
   autotune >"${sim}/plateau.log" 2>&1

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remote Linux kernel lifecycle; kept separate from TCP measurement and rollback.
 set -Eeuo pipefail
-KERNEL_HELPER_VERSION="2.7.1"
+KERNEL_HELPER_VERSION="2.8.0"
 K_ROOT="/var/lib/bbr-tcp-tuning/kernels"
 K_LATEST="${K_ROOT}/latest"
 K_YES=0
@@ -194,8 +194,11 @@ k_confirm_install() {
   (( K_YES )) || k_yes_no '继续下载、校验并安装？' || k_die '已取消'
 }
 k_lock() {
+  umask 077
   mkdir -p "$K_ROOT"
   command -v flock >/dev/null || k_die '缺少 flock（util-linux），不能安全串行化内核操作'
+  exec 8>"${K_ROOT%/*}/operation.lock"
+  flock -n 8 || k_die '已有 TCP 调优、内核或更新操作正在运行，请等待完成'
   exec 9>"${K_ROOT}/lock"
   flock -n 9 || k_die '另一个内核操作正在运行'
 }
@@ -203,7 +206,7 @@ k_init_session() {
   umask 077
   K_SESSION="${K_ROOT}/$(date +%Y%m%d-%H%M%S)-$$"
   mkdir -p "$K_SESSION"
-  exec > >(tee -a "${K_SESSION}/run.log") 2>&1
+  exec > >(tee -a "${K_SESSION}/run.log" 8>&- 9>&-) 2>&1
   trap k_failed EXIT
   k_log "审计目录：$K_SESSION"
 }
@@ -407,7 +410,10 @@ k_download_release_config() {
   done
 }
 k_package_status() {
-  dpkg-query -W -f='${db:Status}\t${Version}\n' "$1" 2>/dev/null || true
+  local rc
+  if LC_ALL=C dpkg-query -W -f='${Status}\t${Version}\n' "$1" 2>/dev/null; then return 0; else rc=$?; fi
+  # Exit 1 means no matching package; other failures must not mean “absent”.
+  (( rc == 1 )) || printf 'query-error-%s\n' "$rc"
 }
 k_existing_target_state() {
   local image_package="linux-image-${K_TARGET}" headers_package="linux-headers-${K_TARGET}"
@@ -415,8 +421,8 @@ k_existing_target_state() {
   local image_state headers_state
   image_status="$(k_package_status "$image_package")"
   headers_status="$(k_package_status "$headers_package")"
-  [[ "$image_status" == $'install ok installed\t'* ]] && image_version="${image_status#*$'\t'}"
-  [[ "$headers_status" == $'install ok installed\t'* ]] && headers_version="${headers_status#*$'\t'}"
+  [[ "$image_status" == $'install ok installed\t'* || "$image_status" == $'hold ok installed\t'* ]] && image_version="${image_status#*$'\t'}"
+  [[ "$headers_status" == $'install ok installed\t'* || "$headers_status" == $'hold ok installed\t'* ]] && headers_version="${headers_status#*$'\t'}"
   [[ ! -d "${K_MODULES_DIR}/${K_TARGET}" ]] || module_version="$(modinfo -k "$K_TARGET" -F version tcp_bbr 2>/dev/null || true)"
 
   if [[ "$K_TARGET" == "$K_OLD" ]]; then
@@ -428,8 +434,10 @@ k_existing_target_state() {
       && cmp -s "${K_SESSION}/release.config" "${K_BOOT_DIR}/config-${K_TARGET}"; then
     state=complete
   elif [[ -z "$image_status" && -z "$headers_status" \
-      && ! -e "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" && ! -e "${K_BOOT_DIR}/initrd.img-${K_TARGET}" \
-      && ! -e "${K_BOOT_DIR}/config-${K_TARGET}" && ! -e "${K_MODULES_DIR}/${K_TARGET}" ]]; then
+      && ! -e "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" && ! -L "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" \
+      && ! -e "${K_BOOT_DIR}/initrd.img-${K_TARGET}" && ! -L "${K_BOOT_DIR}/initrd.img-${K_TARGET}" \
+      && ! -e "${K_BOOT_DIR}/config-${K_TARGET}" && ! -L "${K_BOOT_DIR}/config-${K_TARGET}" \
+      && ! -e "${K_MODULES_DIR}/${K_TARGET}" && ! -L "${K_MODULES_DIR}/${K_TARGET}" ]]; then
     state=absent
   fi
 
@@ -512,6 +520,7 @@ k_finalize_installed_target() {
   k_log '未添加软件源、未运行上游脚本；后续安全更新需重新执行 install 并经过试启动/验证'
 }
 k_adopt_existing_target() {
+  [[ "$(k_existing_target_state)" == complete ]] || k_die "接管前目标状态发生变化，未修改启动项；详情：${K_SESSION}/existing-target.tsv"
   k_log "检测到完全匹配的目标内核已安装：${K_TARGET}；不会覆盖或重复安装"
   k_guard_old_boot
   k_finalize_installed_target
@@ -541,10 +550,10 @@ k_install_artifacts() {
 }
 k_install() {
   local target_state
-  k_linux; k_root; k_detect_os
+  k_linux; k_root; k_lock; k_detect_os
   k_require_environment
   k_confirm_install
-  k_lock; k_init_session
+  k_init_session
   k_prepare_tools
   [[ "$(k_secure_boot)" == disabled ]] || k_die 'Secure Boot 已启用或未知，停止自动安装'
   k_grub_entry "$K_OLD" >/dev/null || k_die '原内核启动项不明确，拒绝开始内核下载'
@@ -590,7 +599,7 @@ k_verify() {
 }
 k_continue() {
   k_linux; k_root; k_lock; k_load_last
-  exec > >(tee -a "${K_SESSION}/run.log") 2>&1
+  exec > >(tee -a "${K_SESSION}/run.log" 8>&- 9>&-) 2>&1
   case "$K_ACTION" in
     verify) k_verify ;;
     trial)
@@ -641,14 +650,21 @@ k_menu() {
   cat <<'MENU'
 
 BBRv3 内核管理
+----------------------------------------------------------------
+  环境与安装
   1) 检测环境与来源说明
   2) 安装 Actions-bbr-v3 最新标准版内核
+
+  启动与验证
   3) 下一次启动试用新内核
   4) 重启后验证 BBRv3
   5) 确认新内核为默认
   6) 下次恢复旧内核
+
   7) 查看操作状态
   0) 返回
+
+  仅标准版 · 保留旧内核 · 不自动重启
 MENU
   read -r -p '请选择：' choice || return
   case "$choice" in 1) K_ACTION=plan ;; 2) K_ACTION=install ;; 3) K_ACTION=trial ;; 4) K_ACTION=verify ;; 5) K_ACTION=accept ;; 6) K_ACTION=fallback ;; 7) K_ACTION=status ;; 0) return ;; *) k_die '无效选择' ;; esac
