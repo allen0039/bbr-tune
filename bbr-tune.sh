@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.6.0"
+VERSION="2.6.1"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -1107,11 +1107,12 @@ parse_iperf_json() {
   values="$(python3 - "$file" "$expected_streams" "$expected_duration" <<'PY_JSON'
 import json, math, statistics, sys
 
-def number(v, positive=False):
+def number(v, field, positive=False):
     if isinstance(v, bool) or not isinstance(v, (float, int)) or not math.isfinite(v):
-        raise ValueError("non-finite or missing metric")
+        raise ValueError(f"{field}={v!r}；需要有限数值")
     if v < 0 or (positive and v <= 0):
-        raise ValueError("invalid metric range")
+        requirement = "大于 0" if positive else "大于或等于 0"
+        raise ValueError(f"{field}={v!r}；要求{requirement}")
     return v
 
 try:
@@ -1122,41 +1123,50 @@ try:
     start = data["start"]
     test = start["test_start"]
     if test.get("protocol") != "TCP" or test.get("reverse") != 1:
-        raise ValueError("expected reverse TCP test")
+        raise ValueError(f"start.test_start：要求 TCP 反向测试，实际 protocol={test.get('protocol')!r}, reverse={test.get('reverse')!r}")
     sent = data["end"]["sum_sent"]
-    sent_rate = number(sent["bits_per_second"], True)
-    sent_bytes = number(sent["bytes"], True)
-    retrans = number(sent["retransmits"])
+    sent_rate = number(sent.get("bits_per_second"), "end.sum_sent.bits_per_second", True)
+    sent_bytes = number(sent.get("bytes"), "end.sum_sent.bytes", True)
+    retrans = number(sent.get("retransmits"), "end.sum_sent.retransmits")
     streams = data["end"].get("streams", [])
     if int(sys.argv[2]) and len(streams) != int(sys.argv[2]):
-        raise ValueError("stream count does not match requested test")
-    if int(sys.argv[3]) and number(sent["seconds"], True) < int(sys.argv[3]) - 2:
-        raise ValueError("test shorter than requested duration")
+        raise ValueError(f"end.streams：实际 {len(streams)} 个流，要求 {sys.argv[2]} 个流")
+    if int(sys.argv[3]) and number(sent.get("seconds"), "end.sum_sent.seconds", True) < int(sys.argv[3]) - 2:
+        raise ValueError(f"end.sum_sent.seconds={sent['seconds']!r}；未达到请求时长 {sys.argv[3]} 秒（容差 2 秒）")
     received = data["end"].get("sum_received", {})
     rate, rate_source = sent_rate, "sender"
     if "bits_per_second" in received:
-        receiver_rate = number(received["bits_per_second"])
-        receiver_seconds = number(received.get("seconds", 0))
-        receiver_bytes = number(received.get("bytes", 0))
-        # Some server versions emit an empty receiver placeholder. Only that
-        # placeholder permits sender fallback; a measured zero goodput does not.
-        if receiver_rate > 0 or receiver_seconds > 0 or receiver_bytes > 0:
-            rate, rate_source = number(receiver_rate, True), "receiver"
+        receiver_rate = number(received["bits_per_second"], "end.sum_received.bits_per_second")
+        receiver_bytes = number(received.get("bytes", 0), "end.sum_received.bytes")
+        number(received.get("seconds", 0), "end.sum_received.seconds")
+        # This parser consumes reverse-test SERVER output. iperf3 can emit an
+        # unreported receiver summary with a positive duration and zero bytes/rate.
+        # Its sender flag describes the local role, not the name of the summary.
+        # Legacy server output may omit role flags; an explicit receiving role
+        # or any positive received byte count must never be treated as a placeholder.
+        placeholder = (receiver_rate == 0 and receiver_bytes == 0
+                       and sent.get("sender") is not False
+                       and received.get("sender") is not False)
+        if placeholder:
+            rate_source = "sender-unreported-receiver"
+        else:
+            rate, rate_source = number(receiver_rate, "end.sum_received.bits_per_second", True), "receiver"
+
     mss = start.get("tcp_mss_default", 0)
     if isinstance(mss, (int, float)) and math.isfinite(mss) and 0 < mss <= 65535:
         mss, retrans_source = float(mss), "estimated-mss"
     else:
         mss, retrans_source = 1448, "estimated-1448"
     rtts, min_rtts = [], []
-    for item in streams:
+    for stream_index, item in enumerate(streams):
         sender = item.get("sender", item)
         for field, target in (("mean_rtt", rtts), ("min_rtt", min_rtts)):
             if field in sender:
-                value = number(sender[field])
+                value = number(sender[field], f"end.streams[{stream_index}].sender.{field}")
                 if value > 0:
                     target.append(value / 1000)
     rates = []
-    for interval in data.get("intervals", []):
+    for interval_index, interval in enumerate(data.get("intervals", [])):
         total = interval.get("sum")
         if total is None:
             parts = interval.get("streams", [])
@@ -1168,7 +1178,7 @@ try:
         # Ignore the first second and very short tail intervals, not real zero-throughput samples.
         if total.get("omitted") or total.get("start", 0) < 1 or total["end"] - total["start"] < 0.5:
             continue
-        rates.append(number(total["bits_per_second"]))
+        rates.append(number(total.get("bits_per_second"), f"intervals[{interval_index}].sum.bits_per_second"))
     cv = "NA"
     if len(rates) >= 3 and statistics.mean(rates) > 0:
         cv = f"{statistics.pstdev(rates)/statistics.mean(rates)*100:.4f}"
@@ -1179,7 +1189,7 @@ try:
     print(f"{rate/1e6:.2f}\t{sent_bytes:.0f}\t{retrans:.0f}\t{retrans*mss/sent_bytes*100:.4f}"
           f"\t{rtt:.2f}\t{client}\t{cv}\t{minimum:.2f}\t{retrans_source}\t{rate_source}")
 except (ValueError, KeyError, TypeError, AttributeError, OSError, OverflowError) as exc:
-    print(f"Invalid iperf3 measurement: {exc}", file=sys.stderr)
+    print(f"[PARSE] 测试结果校验失败：{exc}", file=sys.stderr)
     sys.exit(1)
 PY_JSON
 )" || return 1
@@ -1424,22 +1434,40 @@ average_rtt_samples() {
 }
 
 iperf_result_is_valid() {
-  local file="$1"
-  parse_iperf_json "$file" || return 1
+  local file="$1" streams="${2:-0}" duration="${3:-0}"
+  parse_iperf_json "$file" "$streams" "$duration" || return 1
   awk -v bytes="$RESULT_BYTES" -v mbps="$RESULT_MBPS" 'BEGIN {exit !(bytes>0 && mbps>=0)}'
+}
+
+iperf_attempt_has_summary() {
+  python3 - "$1" <<'PY_SUMMARY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f: data=json.load(f)
+    # Transport errors and scans may leave a partial JSON object. A complete
+    # summary with invalid metrics is different: retrying cannot fix the parser.
+    end=data.get("end", {})
+    complete=(not data.get("error") and isinstance(end, dict)
+              and (isinstance(end.get("sum_sent"), dict)
+                   or isinstance(end.get("sum_received"), dict)))
+    sys.exit(0 if complete else 1)
+except (ValueError, TypeError, AttributeError, OSError): sys.exit(1)
+PY_SUMMARY
 }
 
 iperf_server_loop() {
   local final_json="$1" final_err="$2" port="$3" family="${4:--4}"
-  local attempt_json="${final_json}.attempt" attempt_err="${final_err}.attempt"
-  local server_pid="" rc=0 attempt=0
+  local streams="${5:-0}" duration="${6:-0}" attempt_json attempt_err validation_file
+  local server_pid="" rc=0 attempt=0 valid=0
 
   trap 'if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; exit 143' TERM INT
   : >"$final_err"
   while true; do
     attempt=$((attempt+1))
-    : >"$attempt_json"
-    : >"$attempt_err"
+    attempt_json="$(printf '%s.attempt-%03d.json' "${final_json%.json}" "$attempt")"
+    attempt_err="${attempt_json%.json}.err"
+    validation_file="${attempt_json%.json}.validation.log"
+    : >"$attempt_json"; : >"$attempt_err"
     iperf3 "$family" -s -1 -J -p "$port" >"$attempt_json" 2>"$attempt_err" &
     server_pid=$!
     set +e
@@ -1448,20 +1476,28 @@ iperf_server_loop() {
     set -e
     server_pid=""
 
-    if iperf_result_is_valid "$attempt_json"; then
+    valid=0
+    if iperf_result_is_valid "$attempt_json" "$streams" "$duration" 2>"$validation_file"; then valid=1; fi
+    if (( rc != 0 )); then printf '[PROCESS] iperf3 退出码：%s\n' "$rc" >>"$validation_file"; fi
+    if (( valid == 1 && rc == 0 )); then
       mv -f "$attempt_json" "$final_json"
       [[ ! -s "$attempt_err" ]] || cat "$attempt_err" >>"$final_err"
-      rm -f "$attempt_err"
+      rm -f "$attempt_err" "$validation_file"
       return 0
     fi
 
     {
-      printf '[%s] ignored_connection=%s server_exit=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$attempt" "$rc"
-      cat "$attempt_err"
-      cat "$attempt_json"
-      printf '\n'
+      printf '[%s] attempt=%s server_exit=%s raw_json=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$attempt" "$rc" "$attempt_json"
+      cat "$attempt_err" "$validation_file"
     } >>"$final_err"
-    warn "测试端口收到无效或不完整连接，iperf3 监听已自动恢复（第 ${attempt} 次）"
+    if iperf_attempt_has_summary "$attempt_json"; then
+      error "iperf3 已返回汇总，但结果校验或进程状态异常（退出码 ${rc}）；停止本轮，不作为端口扫描反复重试"
+      cat "$validation_file" >&2
+      error "原始结果：${attempt_json}；校验日志：${validation_file}"
+      return 65
+    fi
+    printf 'ignored_connection=%s\n' "$attempt" >>"$final_err"
+    warn "测试连接未完成，iperf3 监听已自动恢复（第 ${attempt} 次）；记录：${attempt_json}"
     sleep 0.1
   done
 }
@@ -1479,13 +1515,13 @@ wait_for_iperf_listener() {
 }
 
 run_reverse_test() {
-  local label="$1" streams="$2" address="$3" display_label="${4:-$1}" json_file err_file rtt_file elapsed=0 limit rc sample fallback_addr fallback_rtt
+  local label="$1" streams="$2" address="$3" display_label="${4:-$1}" json_file err_file rtt_file elapsed=0 limit rc sample fallback_addr fallback_rtt connected_seen=0
   json_file="${SESSION_DIR}/${label}.json"
   err_file="${SESSION_DIR}/${label}.err"
   rtt_file="${SESSION_DIR}/${label}.rtt-samples"
   port_is_free "$TEST_PORT" || die "测试端口 ${TEST_PORT} 已被占用"
   : >"$json_file"; : >"$err_file"; : >"$rtt_file"
-  iperf_server_loop "$json_file" "$err_file" "$TEST_PORT" "$IPERF_FAMILY" &
+  iperf_server_loop "$json_file" "$err_file" "$TEST_PORT" "$IPERF_FAMILY" "$streams" "$DURATION" &
   CURRENT_TEST_PID=$!
   if ! wait_for_iperf_listener "$TEST_PORT" "$CURRENT_TEST_PID"; then
     kill "$CURRENT_TEST_PID" 2>/dev/null || true
@@ -1500,36 +1536,43 @@ run_reverse_test() {
   printf '本地只需执行下面一条命令（不会修改本地 TCP 参数）：\n\n'
   printf '  iperf3 %s -c %s -p %s -R -P %s -t %s -i 1\n\n' "$IPERF_FAMILY" "$address" "$TEST_PORT" "$streams" "$DURATION"
   printf '等待规则：最多等待连接 %s 秒；开始传输后约运行 %s 秒。\n' "$WAIT_SECONDS" "$DURATION"
-  printf '若端口被扫描或收到无效连接，服务器会自动恢复监听；请重新执行同一命令。\n'
+  printf '未完成的连接会自动恢复监听；完整结果若校验异常则停止本轮并保留诊断，不反复要求重测。\n'
   printf '如仍提示连接被拒绝，请确认安全组和服务器防火墙允许 TCP %s。\n' "$TEST_PORT"
   limit=$(( WAIT_SECONDS + DURATION + 10 ))
   while kill -0 "$CURRENT_TEST_PID" 2>/dev/null; do
     sleep 1
     elapsed=$((elapsed+1))
+    kill -0 "$CURRENT_TEST_PID" 2>/dev/null || break
     sample="$(sample_tcp_rtt "$TEST_PORT" || true)"
-    [[ -n "$sample" ]] && printf '%s\n' "$sample" >>"$rtt_file"
+    if [[ -n "$sample" ]]; then
+      connected_seen=1
+      printf '%s\n' "$sample" >>"$rtt_file"
+    fi
     if (( elapsed % 5 == 0 )); then
       if port_is_free "$TEST_PORT"; then
         printf '[TEST ] 状态：监听正在自动恢复｜已用 %3s 秒｜端口 %s\n' "$elapsed" "$TEST_PORT"
+      elif (( connected_seen )); then
+        printf '[TEST ] 状态：已检测到 TCP 连接，等待测试汇总｜已用 %3s 秒｜端口 %s\n' "$elapsed" "$TEST_PORT"
       else
         printf '[TEST ] 状态：等待连接或测试进行中｜已用 %3s 秒｜端口 %s｜监听正常\n' "$elapsed" "$TEST_PORT"
       fi
-    fi
-    if (( elapsed == 15 )); then
-      printf '[CHECK] 若本地连接被拒绝，请核对服务器公网地址，并放行安全组/防火墙 TCP %s。\n' "$TEST_PORT"
     fi
     if (( elapsed >= limit )); then
       kill "$CURRENT_TEST_PID" 2>/dev/null || true
       wait "$CURRENT_TEST_PID" 2>/dev/null || true
       CURRENT_TEST_PID=""
-      die "本轮测试超时：服务器监听已启动，但 ${WAIT_SECONDS} 秒内未收到有效测试；请检查公网地址、安全组和服务器防火墙 TCP ${TEST_PORT}"
+      die "本轮测试超时：未取得有效完成结果；端口 ${TEST_PORT}，连接等待 ${WAIT_SECONDS} 秒；请检查客户端输出和 ${err_file}"
     fi
   done
   set +e
   wait "$CURRENT_TEST_PID"; rc=$?
   set -e
   CURRENT_TEST_PID=""
-  (( rc == 0 )) || { cat "$err_file" >&2 || true; die "iperf3 测试失败，退出码 ${rc}"; }
+  if (( rc != 0 )); then
+    cat "$err_file" >&2 || true
+    if (( rc == 65 )); then die "iperf3 汇总校验失败，已保留原始 JSON；这不是监听端口被拒绝，详情：${err_file}"; fi
+    die "iperf3 测试失败，退出码 ${rc}；详情：${err_file}"
+  fi
   parse_iperf_json "$json_file" "$streams" "$DURATION" || { cat "$json_file" >&2 || true; die "无法解析 iperf3 测试结果"; }
   if ! awk -v v="$RESULT_RTT_MS" 'BEGIN {exit !(v>0)}'; then
     RESULT_RTT_MS="$(average_rtt_samples "$rtt_file")"
@@ -1543,8 +1586,13 @@ run_reverse_test() {
   validate_strategy_metrics
   calculate_result_quality
   print_interval_log "$json_file"
-  printf '\n  平均下载吞吐：%s Mbps\n' "$RESULT_MBPS"
-  printf '  吞吐来源：%s；区间波动 CV：%s%%\n' "$RESULT_RATE_SOURCE" "$RESULT_CV_PERCENT"
+  printf '\n  平均测试吞吐：%s Mbps\n' "$RESULT_MBPS"
+  case "$RESULT_RATE_SOURCE" in
+    receiver) printf '  吞吐来源：接收端实测统计\n' ;;
+    sender-unreported-receiver) printf '  吞吐来源：发送端统计（服务端接收汇总为占位记录，不等于接收端实测速率）\n' ;;
+    *) printf '  吞吐来源：发送端统计（未提供接收端速率）\n' ;;
+  esac
+  printf '  区间波动 CV：%s%%\n' "$RESULT_CV_PERCENT"
   printf '  TCP 重传次数：%s 次\n' "$RESULT_RETRANS"
   printf '  估算重传率：%s%%（%s，不是实际丢包率）\n' "$RESULT_RETRANS_PERCENT" "$RESULT_RETRANS_SOURCE"
   if awk -v v="$RESULT_RTT_MS" 'BEGIN {exit !(v>0)}'; then
@@ -1666,6 +1714,7 @@ TCP/BBR 参数优化评估报告
 联合模型：单连接与 ${BALANCE_MULTI_STREAMS} 连接场景等权评估，吞吐使用调和均值，波动/重传取较差侧
 重复测量：每种连接数 ${TEST_REPEATS} 次；吞吐、RTT、估算重传比例取中位数
 稳定性指标：区间吞吐 CV 与重复测量 CV 取较大值；结合负载 RTT 相对对应基线的增长
+吞吐口径：优先接收端统计；反向服务端的接收占位记录回退为发送端速率，具体来源保留在 measurements.tsv
 数据限制：NA 表示缺失而非零；稳定优先缺失区间数据时拒绝选优；重传比例是估算值，不是实际丢包率
 保护条件：单连接和多连接吞吐均不得低于对应基线的 ${BALANCE_MIN_RETENTION_PERCENT}%
 选择原则：优先选择满足单/多连接保护线的候选，再按综合评分排序；未达到绝对目标时仍采用实测最优候选
