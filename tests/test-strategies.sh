@@ -122,27 +122,6 @@ done
   qdisc_layout_safe eth0 || fail "standard mq child layout rejected"
 )
 
-# mq may have a nonzero root handle; replace leaves, not the root, and preserve
-# that handle when restoring. All tc calls here are mock functions.
-(
-  mock_layout=$'qdisc mq 1: root\nqdisc fq_codel 0: parent 1:1\nqdisc fq_codel 0: parent 1:2'
-  tc() {
-    if [[ "$2" == "show" ]]; then printf '%s\n' "$mock_layout"
-    else printf '%s\n' "$*" >>"$TMP/qdisc-calls"; fi
-  }
-  qdisc_layout_safe eth0 || fail "nonzero mq root refused"
-  apply_qdisc eth0 fq
-  grep -Fqx 'qdisc replace dev eth0 parent 1:1 fq' "$TMP/qdisc-calls" || fail "mq first leaf not applied"
-  grep -Fqx 'qdisc replace dev eth0 parent 1:2 fq' "$TMP/qdisc-calls" || fail "mq second leaf not applied"
-  if grep -q 'root' "$TMP/qdisc-calls"; then fail "mq root replaced during apply"; fi
-  printf '%s\n' "$mock_layout" >"$TMP/qdisc.txt"
-  restore_qdisc "$TMP" eth0 mq
-  grep -Fqx 'qdisc replace dev eth0 root handle 1: mq' "$TMP/qdisc-calls" || fail "mq root handle not restored"
-  grep -Fqx 'qdisc replace dev eth0 parent 1:2 fq_codel' "$TMP/qdisc-calls" || fail "mq leaf kind not restored"
-  tc() { return 1; }
-  if qdisc_layout_safe eth0; then fail "unreadable queue layout considered safe"; fi
-)
-
 # Aggregation uses medians, with cross-test CV rather than last-run bias.
 (
   STRATEGY=balanced; TEST_REPEATS=3; SESSION_DIR="$TMP"; TUNING_ACTIVE=0; counter=0

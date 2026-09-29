@@ -1,6 +1,6 @@
 # bbr-tune 使用指南
 
-**版本 2.8.0** · 在远程 Linux 服务器上运行的 TCP / BBR 调优工具。
+**版本 2.8.1** · 在远程 Linux 服务器上运行的 TCP / BBR 调优工具。
 
 服务器执行调优，本地电脑仅运行测速命令。工具不会修改本地电脑的 TCP 参数，不会自动重启服务器，也不会自动开放防火墙端口。
 
@@ -283,6 +283,22 @@ sudo bbr-tune kernel fallback
 ### 存在未完成的内核操作
 
 先执行 `kernel status`。已安装但未试启动时执行 `kernel trial`；已经重启进入新内核时执行 `kernel verify`，确认正常再执行 `kernel accept`；需要返回旧内核时执行 `kernel fallback`。
+
+### 出现 Failed to find specified qdisc 或队列恢复失败
+
+先按「安装或更新」中的命令更新工具，再使用原会话的备份目录恢复：
+
+```bash
+sudo bbr-tune rollback --backup /var/lib/bbr-tcp-tuning/backups/会话编号
+sudo tc -s -d qdisc show dev 出口网卡
+sudo bbr-tune status
+```
+
+- 若显示 `mq 0:`，且所有子队列都为 `fq`，可以保留原有多队列配置继续调优，无需手工删除或替换队列。
+- 若 `mq 0:` 下仍有非 `fq` 子队列，工具会停止，不会修改本次 TCP 参数。请先由服务器管理员检查和配置多队列；不要使用 `--force` 尝试绕过。
+- 若回滚提示根句柄或子队列布局已变化，请保留备份，通过云控制台核对 `qdisc.txt` 与当前队列。**不要直接执行 `tc qdisc del ... root`，也不要用 `confirm` 代替恢复。**
+
+回滚会还原原开机配置和服务启用状态，但不会立即重新执行备份中的旧版队列脚本。恢复后先检查代理业务；如需重新保存调优配置，请使用更新后的工具完成调优并选择写入开机配置。
 
 ### 运行中断或恢复失败
 

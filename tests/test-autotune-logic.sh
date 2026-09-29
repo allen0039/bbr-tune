@@ -182,6 +182,7 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   require_linux() { :; }; require_root() { :; }; have() { return 0; }; pending_guard() { :; }
   install_iperf3_if_needed() { :; }; install_python3_if_needed() { :; }; ensure_bbr() { :; }; schedule_rollback() { :; }
   resolve_iface() { echo eth0; }; guess_server_address() { echo speed.example.com; }; choose_random_port() { echo 34567; }
+  tc() { echo "qdisc fq_codel 0: root"; }
   ip() { return 0; }; qdisc_layout_safe() { return 0; }; root_qdisc_kind() { echo fq_codel; }; apply_candidate() { :; }
   detect_memory_limits() {
     MEM_TOTAL_MIB=8192; MEM_AVAILABLE_MIB=4096; MEM_EFFECTIVE_MIB=8192

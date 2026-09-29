@@ -101,6 +101,7 @@ trap 'rm -rf "$tmp"' EXIT
   choose_random_port() { echo 50001; }; detect_iperf_family() { echo -4; }
   detect_memory_limits() { :; }; ensure_bbr() { :; }; prepare_tcp_rules() { :; }
   sysctl_get() { echo 4096; }; root_qdisc_kind() { echo fq; }; current_buffer_max() { echo 4096; }
+  tc() { echo "qdisc fq 0: root"; }
   qdisc_layout_safe() { :; }; capture_state() { :; }
   pending_guard() { echo cancelled >"$tmp/premature-cancel"; }
   run_balanced_pair() { die 'simulated baseline failure'; }

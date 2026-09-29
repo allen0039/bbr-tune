@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.8.0"
+VERSION="2.8.1"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -641,21 +641,105 @@ current_buffer_max() {
 }
 
 root_qdisc_kind() {
-  tc qdisc show dev "$1" 2>/dev/null | awk '$0~/[[:space:]]root([[:space:]]|$)/{print $2; exit}'
+  tc qdisc show dev "$1" 2>/dev/null | awk '$1=="qdisc" && $0~/[[:space:]]root([[:space:]]|$)/{print $2; exit}'
+}
+
+qdisc_error() { printf '[QDISC] %s\n' "$*" >&2; }
+
+# Read only qdisc records; tc -s -d also includes counters and diagnostic lines.
+# Format: attachment (root or normalized parent), kind, handle.
+qdisc_parse_layout() {
+  awk '
+    function hex(s) { s=tolower(s); sub(/^0+/, "", s); return s=="" ? "0" : s }
+    function id(s, a) { split(s,a,":"); return hex(a[1]) ":" (a[2]=="" ? "" : hex(a[2])) }
+    $1=="qdisc" {
+      if ($2=="ingress" || $2=="clsact") next
+      if ($2!~/^[a-zA-Z0-9_]+$/ || $3!~/^[[:xdigit:]]+:$/) {bad=1; next}
+      parent=""; isroot=0
+      for(i=4;i<=NF;i++) {
+        if($i=="root") isroot++
+        if($i=="parent") {if(parent!="")bad=1; parent=$(i+1)}
+      }
+      if(isroot==1 && parent=="") {
+        roots++; rootkind=$2; handle=id($3)
+      } else if(isroot==0 && parent~/^[[:xdigit:]]*:[[:xdigit:]]+$/) {
+        parent=id(parent)
+        if(parent~/:0$/ || parent in kinds) bad=1
+        kinds[parent]=$2; handles[parent]=id($3); leaves++
+      } else bad=1
+    }
+    END {
+      if(roots!=1) bad=1
+      if(rootkind=="mq") {
+        if(!leaves) bad=1
+        for(parent in kinds) {
+          split(parent,a,":")
+          if(a[1] ":" != handle) bad=1
+        }
+      }
+      if(bad) exit 1
+      print "root\t" rootkind "\t" handle
+      for(parent in kinds) print parent "\t" kinds[parent] "\t" handles[parent]
+    }
+  ' | LC_ALL=C sort
+}
+
+qdisc_read_layout() {
+  local text layout
+  text="$(tc qdisc show dev "$1")" || { qdisc_error "无法读取 $1 的队列，未执行队列变更"; return 1; }
+  layout="$(qdisc_parse_layout <<<"$text")" || { qdisc_error "$1 的队列信息为空、不完整或格式无法确认，未执行队列变更"; return 1; }
+  printf '%s\n' "$layout"
 }
 
 qdisc_safe() {
-  case "$1" in ""|noqueue|pfifo_fast|fq_codel|fq|mq) return 0 ;; *) return 1 ;; esac
+  case "$1" in noqueue|pfifo_fast|fq_codel|fq|mq) return 0 ;; *) return 1 ;; esac
 }
 
 qdisc_layout_safe() {
-  local iface="$1" kind layout
-  layout="$(tc qdisc show dev "$iface")" || return 1
-  kind="$(awk '$0~/[[:space:]]root([[:space:]]|$)/{print $2; exit}' <<<"$layout")"
-  [[ -n "$kind" ]] && qdisc_safe "$kind" || return 1
-  while read -r kind; do
+  local layout parent kind handle
+  layout="$(qdisc_read_layout "$1")" || return 1
+  while read -r parent kind handle; do
     qdisc_safe "$kind" || return 1
-  done < <(awk '/ parent / {print $2}' <<<"$layout")
+  done <<<"$layout"
+}
+
+# Keep root identity and leaf attachment/type; auto-assigned leaf handles may
+# change when replacing a leaf. Queue options are never rewritten for a no-op.
+qdisc_shape() {
+  awk '{print $1, $2, ($1=="root" ? $3 : "")}' <<<"$1"
+}
+
+qdisc_can_apply_layout() {
+  local layout="$1" target="$2" root handle parent kind unused
+  case "$target" in fq|fq_codel|pfifo_fast|sfq|cake) ;;
+    *) qdisc_error "不支持的目标队列：$target"; return 1 ;;
+  esac
+  read -r root handle <<<"$(awk '$1=="root"{print $2,$3}' <<<"$layout")"
+  while read -r parent kind unused; do
+    [[ "$kind" != "$target" ]] || continue
+    if ! qdisc_safe "$kind" && [[ "${FORCE:-0}" != 1 ]]; then
+      qdisc_error "${parent} 上的 ${kind} 不是默认队列，保持原有 QoS 配置"
+      return 1
+    fi
+  done <<<"$layout"
+  if [[ "$root" == mq ]]; then
+    while read -r parent kind unused; do
+      [[ "$parent" != root && "$kind" != "$target" ]] || continue
+      if [[ "$handle" == 0: ]]; then
+        qdisc_error "mq 0: 的子队列 ${parent} 为 ${kind}，无法安全定位替换；保留根队列和原参数，请先由管理员配置可寻址的多队列布局"
+        return 1
+      fi
+    done <<<"$layout"
+  elif [[ "$(wc -l <<<"$layout" | tr -d ' ')" != 1 && "${FORCE:-0}" != 1 ]]; then
+    qdisc_error "检测到分层队列，未执行替换；请先检查已有 QoS 配置"
+    return 1
+  fi
+}
+
+qdisc_preflight() {
+  local layout
+  layout="$(qdisc_read_layout "$1")" || return 1
+  qdisc_can_apply_layout "$layout" "$2"
 }
 
 select_tuning_qdisc() {
@@ -664,19 +748,51 @@ select_tuning_qdisc() {
 }
 
 apply_qdisc() {
-  local iface="$1" kind="$2" root parents parent
-  root="$(root_qdisc_kind "$iface")"
-  if [[ "$root" == "mq" ]]; then
-    parents="$(tc qdisc show dev "$iface" | awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1)~/^[[:xdigit:]]*:[[:xdigit:]]+$/) print $(i+1)}' | sort -u)"
-    if [[ -n "$parents" ]]; then
-      while read -r parent; do
-        [[ -n "$parent" ]] && tc qdisc replace dev "$iface" parent "$parent" "$kind" || return 1
-      done <<<"$parents"
-      return
+  local iface="$1" target="$2" before after expected root handle parent kind unused
+  before="$(qdisc_read_layout "$iface")" || return 1
+  qdisc_can_apply_layout "$before" "$target" || return 1
+  read -r root handle <<<"$(awk '$1=="root"{print $2,$3}' <<<"$before")"
+  if [[ "$root" == mq ]]; then
+    expected="$(awk -v target="$target" 'BEGIN{OFS="\t"} $1!="root"{$2=target} {print $1,$2,$3}' <<<"$before")"
+    if [[ "$(qdisc_shape "$before")" == "$(qdisc_shape "$expected")" ]]; then
+      printf '[QDISC] %s｜保留 mq %s；%s 个子队列已为 %s，无需替换\n' "$iface" "$handle" "$(awk '$1!="root"{n++} END{print n+0}' <<<"$before")" "$target"
+      return 0
     fi
-    return 1
+    while read -r parent kind unused; do
+      [[ "$parent" != root && "$kind" != "$target" ]] || continue
+      tc qdisc replace dev "$iface" parent "$parent" "$target" || {
+        qdisc_error "${iface} 子队列 ${parent} 切换为 ${target} 失败；未删除根队列"; return 1;
+      }
+    done <<<"$before"
+    after="$(qdisc_read_layout "$iface")" || return 1
+    [[ "$(qdisc_shape "$after")" == "$(qdisc_shape "$expected")" ]] || {
+      qdisc_error "${iface} 多队列读回结果与预期不一致"; return 1;
+    }
+  else
+    if [[ "$root" == "$target" ]]; then
+      printf '[QDISC] %s｜根队列已为 %s，无需替换\n' "$iface" "$target"
+      return 0
+    fi
+    tc qdisc replace dev "$iface" root "$target" || return 1
+    after="$(qdisc_read_layout "$iface")" || return 1
+    [[ "$(awk '{print $1,$2}' <<<"$after")" == "root $target" ]] || {
+      qdisc_error "${iface} 根队列读回结果与预期不一致"; return 1;
+    }
   fi
-  tc qdisc replace dev "$iface" root "$kind"
+}
+
+render_qdisc_helper() {
+  printf '#!/usr/bin/env bash\n# Managed by bbr-tune.sh\nset -Eeuo pipefail\n'
+  declare -f qdisc_error qdisc_parse_layout qdisc_read_layout qdisc_safe qdisc_shape qdisc_can_apply_layout apply_qdisc
+  cat <<'EOF_HELPER'
+source /etc/default/bbr-tcp-tuning
+iface="$BBR_IFACE"
+if [[ "$iface" == auto ]]; then
+  iface="$(ip -o route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+fi
+[[ -n "$iface" ]] || { qdisc_error '无法识别出口网卡'; exit 1; }
+apply_qdisc "$iface" "${BBR_QDISC:-fq}"
+EOF_HELPER
 }
 
 prepare_tcp_rules() {
@@ -808,8 +924,8 @@ validate_candidate_kernel_state() {
 apply_candidate() {
   local iface="$1" buffer_mib="$2" buffer_bytes
   buffer_bytes=$(( buffer_mib * 1048576 ))
+  apply_qdisc "$iface" fq || die "fq 队列未能安全应用，本候选未修改 TCP 参数"
   apply_sysctl_content "$buffer_bytes"
-  apply_qdisc "$iface" fq || die "fq 队列应用失败，无法测试此候选"
   validate_candidate_kernel_state "$buffer_bytes"
 }
 
@@ -840,26 +956,7 @@ write_persistent_config() {
 BBR_IFACE=$(printf '%q' "$iface")
 BBR_QDISC=$(printf '%q' "$TUNING_QDISC")
 EOF_ENV
-  cat <<'EOF_HELPER' | atomic_write "$QDISC_HELPER" 0755
-#!/usr/bin/env bash
-set -Eeuo pipefail
-source /etc/default/bbr-tcp-tuning
-iface="$BBR_IFACE"
-kind="${BBR_QDISC:-fq}"
-if [[ "$iface" == "auto" ]]; then
-  iface="$(ip -o route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-fi
-root="$(tc qdisc show dev "$iface" | awk '$0~/[[:space:]]root([[:space:]]|$)/{print $2; exit}')"
-if [[ "$root" == "mq" ]]; then
-  parents="$(tc qdisc show dev "$iface" | awk '{for(i=1;i<=NF;i++) if($i=="parent" && $(i+1)~/^[[:xdigit:]]*:[[:xdigit:]]+$/) print $(i+1)}' | sort -u)"
-  if [[ -n "$parents" ]]; then
-    while read -r parent; do [[ -n "$parent" ]] && tc qdisc replace dev "$iface" parent "$parent" "$kind"; done <<<"$parents"
-    exit 0
-  fi
-  exit 1
-fi
-tc qdisc replace dev "$iface" root "$kind"
-EOF_HELPER
+  render_qdisc_helper | atomic_write "$QDISC_HELPER" 0755
   cat <<'EOF_SERVICE' | atomic_write "$SERVICE_FILE" 0644
 [Unit]
 Description=TCP BBR and selected queue discipline setup
@@ -894,7 +991,7 @@ backup_file() {
 }
 
 create_backup() {
-  local iface="$1" backup key value service_enabled="unknown" service_active="unknown"
+  local iface="$1" backup key value layout service_enabled="unknown" service_active="unknown"
   backup="${BACKUP_ROOT}/${SESSION_ID}"
   mkdir -p "$backup"
   : >"${backup}/files.tsv"
@@ -907,13 +1004,14 @@ create_backup() {
     service_enabled="$(systemctl is-enabled bbr-tcp-tuning.service 2>/dev/null || true)"
     service_active="$(systemctl is-active bbr-tcp-tuning.service 2>/dev/null || true)"
   fi
+  tc -s -d qdisc show dev "$iface" >"${backup}/qdisc.txt" || { error "无法备份出口队列"; return 1; }
+  layout="$(qdisc_parse_layout <"${backup}/qdisc.txt")" || { error "队列备份不完整，尚未修改参数"; return 1; }
   cat >"${backup}/meta.env" <<EOF_META
 IFACE=$(printf '%q' "$iface")
-ROOT_QDISC=$(printf '%q' "$(root_qdisc_kind "$iface")")
+ROOT_QDISC=$(printf '%q' "$(awk '$1=="root"{print $2}' <<<"$layout")")
 SERVICE_ENABLED=$(printf '%q' "$service_enabled")
 SERVICE_ACTIVE=$(printf '%q' "$service_active")
 EOF_META
-  tc -s -d qdisc show dev "$iface" >"${backup}/qdisc.txt" 2>&1 || true
   : >"${backup}/sysctl.tsv"
   for key in "${TUNING_SYSCTL_KEYS[@]}"; do
     if sysctl_exists "$key"; then
@@ -945,36 +1043,68 @@ restore_files() {
 }
 
 restore_qdisc() {
-  local backup="$1" iface="$2" kind="$3" parent leaf handle
-  case "$kind" in
-    ""|noqueue|pfifo_fast|mq|fq|fq_codel|sfq|cake) ;;
-    *) error "原 qdisc ${kind} 无法自动重建；当前队列保持不动，请参考 ${backup}/qdisc.txt"; return 1 ;;
-  esac
-  if [[ "$kind" == mq ]]; then
-    while read -r leaf; do
-      case "$leaf" in fq|fq_codel|pfifo_fast|sfq|cake) ;;
-        *) error "mq 子队列 ${leaf} 无法完整恢复，请按备份手工处理"; return 1 ;;
-      esac
-    done < <(awk '/ parent / {print $2}' "${backup}/qdisc.txt")
+  local backup="$1" iface="$2" recorded_kind="$3" saved current after root handle current_root current_handle parent leaf unused present
+  [[ -r "${backup}/qdisc.txt" ]] || { qdisc_error '缺少原始队列备份，当前队列保持不动'; return 1; }
+  saved="$(qdisc_parse_layout <"${backup}/qdisc.txt")" || { qdisc_error '队列备份无法解析，当前队列保持不动'; return 1; }
+  read -r root handle <<<"$(awk '$1=="root"{print $2,$3}' <<<"$saved")"
+  [[ -z "$recorded_kind" || "$root" == "$recorded_kind" ]] || { qdisc_error '队列备份与元数据不一致'; return 1; }
+  current="$(qdisc_read_layout "$iface")" || return 1
+  if [[ "$(qdisc_shape "$saved")" == "$(qdisc_shape "$current")" ]]; then
+    printf '[QDISC] %s｜队列布局与备份一致，保留现有队列\n' "$iface"
+    return 0
   fi
-  tc qdisc del dev "$iface" root 2>/dev/null || true
-  case "$kind" in
-    ""|noqueue) ;;
-    pfifo_fast) tc qdisc replace dev "$iface" root pfifo_fast 2>/dev/null || return 1 ;;
-    mq)
-      handle="$(awk '$0~/[[:space:]]root([[:space:]]|$)/{print $3; exit}' "${backup}/qdisc.txt")"
-      if [[ "$handle" =~ ^[[:xdigit:]]+:$ && "$handle" != "0:" ]]; then
-        tc qdisc replace dev "$iface" root handle "$handle" mq 2>/dev/null || return 1
-      else
-        tc qdisc replace dev "$iface" root mq 2>/dev/null || return 1
+  read -r current_root current_handle <<<"$(awk '$1=="root"{print $2,$3}' <<<"$current")"
+  if [[ "$root" == mq ]]; then
+    # Do not delete/recreate an mq root, even after a partially failed operation.
+    if [[ "$current_root" != mq || "$current_handle" != "$handle" ||
+          "$(awk '{print $1}' <<<"$saved")" != "$(awk '{print $1}' <<<"$current")" ]]; then
+      qdisc_error "${iface} 的 mq 根句柄或子队列拓扑已变化，保持当前队列；请参考 ${backup}/qdisc.txt 手工恢复"
+      return 1
+    fi
+    # Validate the complete restore plan before writing the first leaf.
+    while read -r parent leaf unused; do
+      [[ "$parent" != root ]] || continue
+      present="$(awk -v p="$parent" '$1==p{print $2}' <<<"$current")"
+      [[ "$leaf" != "$present" ]] || continue
+      if [[ "$handle" == 0: ]]; then
+        qdisc_error "无法安全定位 mq 0: 的子队列 ${parent}，未删除根队列；请参考 ${backup}/qdisc.txt 手工恢复"
+        return 1
       fi
-      while read -r leaf parent; do
-        case "$leaf" in fq|fq_codel|pfifo_fast|sfq|cake) tc qdisc replace dev "$iface" parent "$parent" "$leaf" 2>/dev/null || return 1 ;; esac
-      done < <(awk '{kind=$2; parent=""; for(i=1;i<=NF;i++) if($i=="parent")parent=$(i+1); if(parent~/^[[:xdigit:]]*:[[:xdigit:]]+$/)print kind,parent}' "${backup}/qdisc.txt")
-      ;;
-    fq|fq_codel|sfq|cake) tc qdisc replace dev "$iface" root "$kind" 2>/dev/null || return 1 ;;
-    *) error "原 qdisc ${kind} 无法完整自动重建，请参考 ${backup}/qdisc.txt"; return 1 ;;
-  esac
+      qdisc_safe "$present" || { qdisc_error "${parent} 已变为自定义队列 ${present}，保持当前队列"; return 1; }
+      case "$leaf" in fq|fq_codel|pfifo_fast|sfq|cake) ;;
+        *) qdisc_error "子队列 ${parent} 的 ${leaf} 无法自动恢复"; return 1 ;;
+      esac
+    done <<<"$saved"
+    while read -r parent leaf unused; do
+      [[ "$parent" != root ]] || continue
+      present="$(awk -v p="$parent" '$1==p{print $2}' <<<"$current")"
+      [[ "$leaf" != "$present" ]] || continue
+      tc qdisc replace dev "$iface" parent "$parent" "$leaf" || return 1
+    done <<<"$saved"
+    after="$(qdisc_read_layout "$iface")" || return 1
+    [[ "$(qdisc_shape "$saved")" == "$(qdisc_shape "$after")" ]] || { qdisc_error '恢复后的多队列读回不一致'; return 1; }
+  else
+    # A flat root can be restored directly; never flatten an unexpected tree.
+    [[ "$(wc -l <<<"$saved" | tr -d ' ')" == 1 &&
+       "$(wc -l <<<"$current" | tr -d ' ')" == 1 ]] || { qdisc_error '队列层级已变化，未执行根队列恢复'; return 1; }
+    qdisc_safe "$current_root" || { qdisc_error '当前为自定义根队列，保持不动'; return 1; }
+    case "$root" in
+      noqueue)
+        # A noqueue root is supplied by the device, not created with replace.
+        [[ "$current_root" != noqueue ]] || return 0
+        tc qdisc del dev "$iface" root || return 1 ;;
+      pfifo_fast|fq|fq_codel|sfq|cake)
+        if [[ "$handle" == 0: ]]; then
+          tc qdisc replace dev "$iface" root "$root" || return 1
+        else
+          tc qdisc replace dev "$iface" root handle "$handle" "$root" || return 1
+        fi ;;
+      *) qdisc_error "原队列 ${root} 无法自动重建，保持当前队列"; return 1 ;;
+    esac
+    after="$(qdisc_read_layout "$iface")" || return 1
+    [[ "$(awk '{print $1,$2}' <<<"$after")" == "root $root" ]] || { qdisc_error '恢复后的根队列读回不一致'; return 1; }
+    [[ "$handle" == 0: || "$(awk '$1=="root"{print $3}' <<<"$after")" == "$handle" ]] || return 1
+  fi
 }
 
 restore_backup() {
@@ -1007,7 +1137,9 @@ restore_backup() {
         systemctl disable bbr-tcp-tuning.service >/dev/null 2>&1 || failed=1
       fi
       if [[ "$SERVICE_ACTIVE" == "active" ]]; then
-        systemctl start bbr-tcp-tuning.service >/dev/null 2>&1 || failed=1
+        # The oneshot only applies qdisc settings. Re-running a restored older
+        # helper could overwrite the queue we just recovered.
+        info "开机服务文件及启用状态已还原；本次不重新执行旧队列脚本，当前队列以备份恢复结果为准"
       fi
     fi
   fi
@@ -2072,6 +2204,7 @@ autotune() {
   if ! qdisc_layout_safe "$iface" && (( ! FORCE )); then
     die "检测到自定义队列布局（root qdisc 为 '${root_kind}'）；为避免破坏现有 QoS，需审计后使用 --force"
   fi
+  qdisc_preflight "$iface" fq || die "当前队列不适合安全自动调整；尚未开始测速或修改 TCP 参数"
   capture_state "$iface" "${SESSION_DIR}/system-before.txt"
 
   section "自动优化会话 ${SESSION_ID}"
