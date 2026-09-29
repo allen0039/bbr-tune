@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -20,6 +20,7 @@ ENV_FILE="/etc/default/bbr-tcp-tuning"
 QDISC_HELPER="/usr/local/sbin/bbr-tcp-qdisc"
 SERVICE_FILE="/etc/systemd/system/bbr-tcp-tuning.service"
 
+KERNEL_ARGS=()
 COMMAND="menu"
 IFACE="auto"
 SERVER_ADDRESS=""
@@ -235,6 +236,7 @@ usage() {
   sudo ./bbr-tune.sh autotune [参数]         自动测试并选择最优参数
   ./bbr-tune.sh status [--iface DEV]         查看当前 TCP/BBR 状态
   ./bbr-tune.sh history                      查看历史测试会话
+  sudo ./bbr-tune.sh kernel [操作]         BBRv3 内核检测、安装、试用与恢复
   sudo ./bbr-tune.sh confirm                 确认保留当前参数并取消安全回滚
   sudo ./bbr-tune.sh rollback [--backup DIR] 恢复调优前参数
 
@@ -281,6 +283,7 @@ parse_args() {
     return
   fi
   case "$1" in
+    kernel) COMMAND=kernel; shift; KERNEL_ARGS=("$@"); return ;;
     menu|autotune|status|history|confirm|rollback|help) COMMAND="$1"; shift ;;
     --help|-h) COMMAND="help"; shift ;;
     --version) printf '%s %s\n' "$PROGRAM" "$VERSION"; exit 0 ;;
@@ -1061,6 +1064,7 @@ capture_state() {
   {
     printf 'time=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'kernel=%s\n' "$(uname -srmo)"
+    printf 'bbr_runtime_version=%s\n' "$(cat /sys/module/tcp_bbr/version 2>/dev/null || echo unknown)"
     printf 'interface=%s\n' "$iface"
     printf 'memory_total_mib=%s\n' "$MEM_TOTAL_MIB"
     printf 'memory_available_mib=%s\n' "$MEM_AVAILABLE_MIB"
@@ -1670,6 +1674,8 @@ TCP/BBR 参数优化评估报告
 [3] 测试环境
 ----------------------------------------------------------------
 会话编号：${SESSION_ID}
+运行内核：$(uname -r)
+运行时 BBR 版本：$(cat /sys/module/tcp_bbr/version 2>/dev/null || echo unknown)
 测试时间：$(date '+%Y-%m-%d %H:%M:%S %z')
 服务器地址：${SERVER_ADDRESS}
 出口网卡：${iface}
@@ -2090,6 +2096,7 @@ status_command() {
   printf '  内核：%s\n' "$(uname -srmo)"
   printf '  出口网卡：%s\n' "$iface"
   printf '  拥塞控制算法：%s\n' "$(sysctl_get net.ipv4.tcp_congestion_control)"
+  printf '  运行时 BBR 版本：%s（未知不表示 v1）\n' "$(cat /sys/module/tcp_bbr/version 2>/dev/null || echo 未知)"
   printf '  内核可用算法：%s\n' "$(sysctl_get net.ipv4.tcp_available_congestion_control)"
   printf '  系统默认队列：%s\n' "$(sysctl_get net.core.default_qdisc)"
   printf '  出口实际队列：%s\n' "$(root_qdisc_kind "$iface")"
@@ -2239,6 +2246,16 @@ ui_autotune() {
     --parallel "$streams" --duration "$duration" \
     --target-utilization "$util" --max-retrans-percent "$retrans" "${args[@]}"
 }
+kernel_command() {
+  local canonical helper
+  canonical="$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")"
+  if [[ -r "${canonical}-kernel" ]]; then helper="${canonical}-kernel"
+  elif [[ -r "${canonical%/*}/bbr-kernel.sh" ]]; then helper="${canonical%/*}/bbr-kernel.sh"
+  else die "缺少配套内核管理脚本，请重新运行一键安装更新"; fi
+  grep -Fqx "KERNEL_HELPER_VERSION=\"${VERSION}\"" "$helper" || die "内核管理脚本版本不匹配，请重新安装完整版本"
+  bash "$helper" "${KERNEL_ARGS[@]}"
+}
+
 menu() {
   [[ -t 0 && -t 1 ]] || { usage; return; }
   require_linux
@@ -2252,6 +2269,7 @@ menu() {
     printf '  4) 确认保留当前参数\n'
     printf '  5) 恢复调优前参数\n'
     printf '  6) 使用说明\n'
+    printf '  7) BBRv3 内核管理（独立安装/编译，不自动重启）\n'
     printf '  0) 退出\n\n'
     read -r -p "请选择：" choice || return
     case "$choice" in
@@ -2261,6 +2279,7 @@ menu() {
       4) ui_execute 1 confirm || true ;;
       5) ui_execute 1 rollback --yes || true ;;
       6) usage ;;
+      7) ui_execute 1 kernel menu || true ;;
       0) return ;;
       *) printf '%s无效选择%s\n' "$UI_RED" "$UI_RESET" ;;
     esac
@@ -2273,6 +2292,7 @@ main() {
   case "$COMMAND" in
     menu) menu ;;
     autotune) autotune ;;
+    kernel) kernel_command ;;
     status) status_command ;;
     history) history_command ;;
     confirm) confirm_tuning ;;

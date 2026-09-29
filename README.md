@@ -1,6 +1,6 @@
 # bbr-tune：按实测规则选择 TCP / BBR 参数
 
-版本 **2.5.0**。在远程 Linux 代理服务器运行；本地电脑只执行屏幕给出的 `iperf3` 命令，不修改本地网络参数。
+版本 **2.6.0**。在远程 Linux 代理服务器运行；本地电脑只执行屏幕给出的 `iperf3` 命令，不修改本地网络参数。
 
 本版本提供 **均衡、速度优先、稳定优先、低重传优先** 四种方案。它们是不同的**实测选优策略**，不是四份固定 sysctl 清单，也不改变 BBR 算法内部增益。每种方案都测试单连接和多连接。
 
@@ -20,13 +20,109 @@ curl -fsSL https://raw.githubusercontent.com/dingding229/bbr-tune/main/install.s
 curl -fsSL https://raw.githubusercontent.com/dingding229/bbr-tune/main/install.sh | sudo bash -s -- --install-only
 ```
 
-安装入口是 `/usr/local/sbin/bbr-tune`，命令链接是 `/usr/local/bin/bbr-tune`。再次启动：
+安装入口是 `/usr/local/sbin/bbr-tune`，命令链接是 `/usr/local/bin/bbr-tune`；配套内核管理文件为 `/usr/local/sbin/bbr-tune-kernel`，安装时校验两者版本一致。再次启动：
 
 ```bash
 sudo bbr-tune
 ```
 
 菜单选择 `1` 后，先选择方案，再填写带宽、服务器地址、并发数、测试时长和目标门槛。服务器缺少 `iperf3` 或 JSON/统计解析需要的 `python3` 时会自动安装；不会为本地电脑安装软件。
+
+## BBRv3 内核：选择、安装与源码构建
+
+菜单 **7** 为独立的内核管理入口。TCP 自动寻优**不会自行安装、切换或重启内核**。先完成内核试用和业务验证，再运行参数寻优，报告会记录当时的内核及运行时 BBR 版本。
+
+### 选择规则与支持范围
+
+- 默认选择 **XanMod LTS 预编译内核**。这是第三方签名仓库，不是 Debian/Ubuntu 官方内核。
+- 默认使用兼容范围更广的 **x86-64-v1**；可显式选择 v2/v3，但必须通过所有可见 vCPU 的指令集检查。`x64v3` 是 CPU 指令集等级，**不等于 BBRv3**。
+- 安装时从签名 APT 元数据解析候选，不在脚本中固定一个会过时的内核版本。仓库密钥固定主指纹：`D38D7D1DA1349567ADED882D86F7D09EE734E623`；换钥时停止，而不是自动信任。
+- 将候选与 kernel.org 的维护中 `stable` / `longterm` 系列比较；RC、EOL、未列出的系列，以及落后于上游当前修订的候选均拒绝自动安装。仓库暂时落后时应等待更新，不绕过检查。
+- 自动安装仅覆盖 **Debian 12/13、Ubuntu 24.04/26.04、amd64、标准 GRUB2**。其他发行版、ARM、systemd-boot、外部引导内核等环境只提供检测，不强行安装 amd64 软件包。
+- 容器、Secure Boot 启用或无法确认、现有 DKMS 模块、ZFS/网络根文件系统、LVM/RAID/非 ext 系列的 `/boot`、缺少旧内核/initramfs/稳定启动项，均停止自动安装。
+- 安装前至少保留 `/boot` 512 MiB、根文件系统 2 GiB 空间。实际空间需求仍受模块及 initramfs 大小影响。
+
+这些检查旨在降低风险，不保证新内核一定能启动，也不保证 BBRv3 一定比现有算法更快。**必须具备云控制台或救援访问能力。**
+
+### 推荐流程：预编译内核
+
+全部在**远程服务器**执行：
+
+```bash
+# 只读评估，不安装
+sudo bbr-tune kernel plan
+
+# 默认 LTS / x86-64-v1；交互确认第三方来源及控制台恢复能力
+sudo bbr-tune kernel install
+
+# 仅设置下一次启动试用新内核，不执行 reboot
+sudo bbr-tune kernel trial
+```
+
+阅读日志和恢复说明后，**自行安排维护窗口重启服务器**。安装结束仍运行原内核，不能把“包已安装”当作“BBRv3 已生效”。
+
+重启后：
+
+```bash
+# 必须同时匹配目标内核和运行时 BBR version=3
+sudo bbr-tune kernel verify
+
+# 网卡、存储、SSH 和代理业务均正常后，确认新内核为默认
+sudo bbr-tune kernel accept
+
+# 再选择均衡/速度/稳定/低重传方案，重新建立单/多连接基线
+sudo bbr-tune
+```
+
+验证只检查内核能力，不修改 TCP sysctl；即使默认拥塞控制仍是 `cubic`，也不妨碍确认内核具备 BBRv3。后续 TCP 调优才应用 `bbr`。仅看到算法名称 `bbr`、包名称或内核版本后缀，不足以通过 BBRv3 验证。
+
+高级选择示例：
+
+```bash
+# 指令集符合条件时才允许安装；main 仍必须是维护中的稳定版
+sudo bbr-tune kernel install --track main --cpu-level 3
+```
+
+非交互安装必须同时提供 `--yes --console-available`。这两个选项只确认操作与恢复能力，不绕过环境、签名、维护状态或 CPU 检查。
+
+### 如有必要，从固定源码编译
+
+```bash
+sudo bbr-tune kernel build
+```
+
+编译使用所选 XanMod 发行版本对应的源码标签，解析并固定完整 Git 提交；校验源码的 `BBR_VERSION=3`，不从任意实验分支 HEAD 拼装内核，也不下载来源不明的补丁。
+
+配置规则：
+
+1. 继承 `/boot/config-当前内核`，保留现有驱动和功能配置；不运行 `localmodconfig`，不按当前已加载模块裁剪驱动。
+2. 启用 BBR 支持（模块或内建）、`fq`、高级拥塞控制；使用通用 CPU 配置和经过验证的 ISA 等级，不使用 `-march=native`。
+3. 添加带源码提交标识的独立 release 后缀，拒绝覆盖当前或已有内核。
+4. 处理发行版专用证书路径，使用构建过程生成的模块签名密钥；**仅在已确认 Secure Boot 关闭时允许此流程**，不关闭安全启动或注册 MOK。
+5. 保存 `config.before`、`config.build`、`config.diff`。`olddefconfig` 会处理新内核的配置差异，不能据此保证每个旧符号都有等价新符号，仍需业务验证。
+6. 不修改 BBRv3 内部增益、pacing 常量、全局调度策略或内存故障策略；速度/稳定/重传偏好仍由后续实测选优决定，不假设一组编译参数能适配所有链路。
+
+构建由专用非 root 用户 `bbr-kbuild` 执行。自动安装编译依赖；最低需要 **2 GiB 总内存、1.5 GiB 可用内存、`/var/tmp` 60 GiB 空闲空间**。编译并发参考总内存的 2/3、当前可用内存及 CPU 数量，最多 8 个任务；不自动创建 swap。这里的可用内存仅用于避免编译时资源耗尽，不改变 TCP 缓存按总内存计算的规则。
+
+空间或内存不足时停止，不强行构建。编译资源消耗较大，**预编译内核仍是默认建议**。源码和构建产物目录记录在 `build-directory.txt`，保留供审计，不自动清理。
+
+### 启动安全与恢复
+
+- 安装前将原内核设为 GRUB 的 saved 默认项，并标记旧 image 包为手动安装，降低被自动清理的风险；不卸载任何内核。
+- `trial` 只设置一次性启动项，旧内核仍是默认项。新内核正常启动后，只有 `accept` 才将它设为长期默认。
+- **这不是自动故障切换保证**。如果新内核卡死、无法启动或 SSH 失联，脚本无法在其中执行恢复，需要云控制台手动重启/从 GRUB 选择旧内核。GRUB 环境区写回等限制仍可能影响一次性启动行为。
+- 尚能 SSH 时，可安排恢复：
+
+```bash
+sudo bbr-tune kernel fallback   # 设置下次启动旧内核，不立即重启
+sudo bbr-tune kernel status
+```
+
+TCP 的 `confirm` / `rollback` 与内核的 `accept` / `fallback` 是不同流程；**TCP 参数回滚不能切换运行内核**。存在待确认的 TCP 调优时，内核安装会拒绝继续。
+
+内核日志与状态保存在 `/var/lib/bbr-tcp-tuning/kernels/<时间戳-PID>/`，包括运行日志、源码标签/提交、包元数据、SHA-256、旧/新内核、启动项 ID 和状态。安装失败可能留下已安装但尚未完成配置的软件包；不会盲目卸载，请先检查日志并修复软件包状态。
+
+仓库配置与密钥仅用于本次隔离 APT 会话，**不添加持久第三方源、不安装跟随升级的元包**，避免未验证内核自动取代当前版本。因此安全更新需要管理员定期重新评估，并重复安装、试用、确认流程。
 
 ## 如何选择方案
 
@@ -239,6 +335,9 @@ sudo bbr-tune rollback --yes
 
 - [Linux IP sysctl 文档](https://docs.kernel.org/networking/ip-sysctl.html)：缓存向量、`tcp_mem`、自动调节、应用相关参数及废弃选项。
 - [Linux BBR 实现](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_bbr.c)：BBR 的带宽/最小 RTT 模型、内部增益和 pacing。
+- [XanMod 官方说明](https://xanmod.org/)：BBRv3 特性、签名仓库、CPU 等级和软件包。
+- [XanMod 内核源码](https://gitlab.com/xanmod/linux)：从签名包元数据关联发行标签。
+- [kernel.org 发布元数据](https://www.kernel.org/releases.json)：维护中稳定/LTS 修订检查。
 - [iperf3 使用说明](https://software.es.net/iperf/invoking.html)：反向测试、并发、JSON 结果。
 
 权重、8 BDP 实验范围和停滞阈值属于本工具明确披露的工程规则，不应解释为内核官方推荐值。
@@ -249,4 +348,4 @@ sudo bbr-tune rollback --yes
 for test in tests/test-*.sh; do bash "$test" || exit; done
 ```
 
-覆盖安装入口、内存与 BDP 边界、四种方案排序、单/多连接保护、复测中位数与波动、输入有效性、最佳努力回退、监听恢复、参数读回验证、格式化报告及历史记录。模拟测试通过不替代远程服务器的实际链路验证。
+覆盖安装入口、内存与 BDP 边界、四种方案排序、单/多连接保护、复测中位数与波动、输入有效性、最佳努力回退、监听恢复、参数读回验证、格式化报告及历史记录。内核测试使用模拟软件包与 GRUB 命令，覆盖 CPU/维护状态/密钥检查、旧内核保护、一次性试用、版本验证、确认与恢复；不在开发机安装内核。模拟测试通过不替代远程服务器的实际启动、完整源码编译和链路验证。

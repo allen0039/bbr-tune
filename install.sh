@@ -9,6 +9,7 @@ INSTALL_PATH="${BBR_TUNE_INSTALL_PATH:-/usr/local/sbin/bbr-tune}"
 LINK_PATH="${BBR_TUNE_LINK_PATH:-/usr/local/bin/bbr-tune}"
 LAUNCH_AFTER_INSTALL="1"
 TEMP_FILE=""
+TEMP_KERNEL_FILE=""
 
 log() { printf '[安装] %s\n' "$*"; }
 warn() { printf '[警告] %s\n' "$*" >&2; }
@@ -16,7 +17,8 @@ die() { printf '[错误] %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 cleanup() {
-  [[ -n "$TEMP_FILE" ]] && rm -f "$TEMP_FILE"
+  [[ -z "$TEMP_FILE" ]] || rm -f "$TEMP_FILE"
+  [[ -z "$TEMP_KERNEL_FILE" ]] || rm -f "$TEMP_KERNEL_FILE"
 }
 
 usage() {
@@ -97,7 +99,8 @@ local_payload_path() {
 }
 
 download_payload() {
-  local destination="$1" url="${RAW_BASE}/bbr-tune.sh"
+  local destination="$1" filename="${2:-bbr-tune.sh}"
+  local url="${RAW_BASE}/${filename}"
   if have curl; then
     curl -fL --retry 3 --connect-timeout 15 "$url" -o "$destination"
   elif have wget; then
@@ -116,8 +119,14 @@ validate_payload() {
 
 install_payload() {
   local source_file="$1" install_path="${2:-$INSTALL_PATH}" link_path="${3:-$LINK_PATH}"
+  local helper="${4:-${source_file%/*}/bbr-kernel.sh}" version helper_version
   validate_payload "$source_file"
+  validate_payload "$helper"
+  version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$source_file")"
+  helper_version="$(sed -n 's/^KERNEL_HELPER_VERSION="\([^"]*\)"$/\1/p' "$helper")"
+  [[ -n "$version" && "$version" == "$helper_version" ]] || die "主程序与内核管理脚本版本不匹配，未安装"
   mkdir -p "$(dirname "$install_path")" "$(dirname "$link_path")"
+  install -m 0755 "$helper" "${install_path}-kernel"
   install -m 0755 "$source_file" "$install_path"
   if [[ "$link_path" != "$install_path" ]]; then
     ln -sfn "$install_path" "$link_path"
@@ -141,24 +150,27 @@ main() {
   install_runtime_dependencies
 
   TEMP_FILE="$(mktemp /tmp/bbr-tune.XXXXXX)"
+  TEMP_KERNEL_FILE="$(mktemp /tmp/bbr-kernel.XXXXXX)"
   trap cleanup EXIT
   if source_file="$(local_payload_path)"; then
     log "使用当前目录中的主程序：$source_file"
     cp "$source_file" "$TEMP_FILE"
+    cp "${source_file%/*}/bbr-kernel.sh" "$TEMP_KERNEL_FILE"
   else
     log "正在从 GitHub 下载最新主程序"
     download_payload "$TEMP_FILE"
+    download_payload "$TEMP_KERNEL_FILE" bbr-kernel.sh
   fi
 
-  install_payload "$TEMP_FILE"
+  install_payload "$TEMP_FILE" "$INSTALL_PATH" "$LINK_PATH" "$TEMP_KERNEL_FILE"
   log "安装完成：$INSTALL_PATH"
   log "命令入口：$LINK_PATH"
   "$LINK_PATH" --version
 
   cleanup
-  TEMP_FILE=""
+  TEMP_FILE=""; TEMP_KERNEL_FILE=""
   trap - EXIT
-  (( LAUNCH_AFTER_INSTALL )) && launch_tool
+  if (( LAUNCH_AFTER_INSTALL )); then launch_tool; fi
 }
 
 if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
