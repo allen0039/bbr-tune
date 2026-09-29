@@ -60,7 +60,7 @@ SERVER_ADDRESS="speed.example.com"
 TARGET_MBPS="1000"; TARGET_UTILIZATION="90"; MAX_RETRANS_PERCENT="1"; RTT_MS="180"; RTT_SOURCE="simulated TCP RTT"
 BALANCE_MULTI_STREAMS="8"; BALANCE_MIN_RETENTION_PERCENT="95"
 MEM_TOTAL_MIB="8192"; MEM_AVAILABLE_MIB="4096"; MEM_EFFECTIVE_MIB="8192"
-MEM_TCP_BUDGET_MIB="5461"; MEM_BUFFER_CAP_MIB="2047"; VM_MIN_FREE_KBYTES="83886"; BDP_MIB="21.46"
+MEM_TCP_BUDGET_MIB="5461"; MEM_BUFFER_CAP_MIB="2047"; BDP_MIB="21.46"
 TCP_MEM_LOW_PAGES="699050"; TCP_MEM_PRESSURE_PAGES="1048576"; TCP_MEM_HIGH_PAGES="1398101"
 BEFORE_CC="cubic"; BEFORE_QDISC="fq_codel"; BEFORE_RMEM="4096 131072 6291456"; BEFORE_WMEM="4096 16384 4194304"
 BEFORE_TCP_MEM="196608 262144 393216"; BEFORE_BUFFER_BYTES="6291456"
@@ -85,11 +85,11 @@ write_comparison eth0 67108864 >/dev/null
 for text in \
   'TCP/BBR 参数优化评估报告' \
   '[5] 性能对比' \
-  '[7] 扩展系统与 TCP 参数明细' \
+  '[7] 系统与 TCP 参数审计（含未修改项）' \
   '[8] 最优候选' \
   '联合模型：单连接与 8 连接场景等权评估' \
   'TCP 聚合内存预算：5461.00 MiB' \
-  'vm.min_free_kbytes：83886 KiB' \
+  'kernel / VM / 路由策略：保留会话开始时的值' \
   '绝对目标未完全满足；已采用本次会话中单/多连接综合表现最优的候选' \
   '单连接吞吐' \
   '  - 调优后：260 Mbps' \

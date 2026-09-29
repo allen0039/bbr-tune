@@ -21,7 +21,6 @@ assert_eq "$high_1g" "$expected_high" "1 GiB tcp_mem high-water mark"
 calculate_memory_buffer_cap 8192
 assert_eq "$MEM_TCP_BUDGET_MIB" "5461" "8 GiB aggregate TCP budget"
 assert_eq "$MEM_BUFFER_CAP_MIB" "2047" "8 GiB signed-sysctl per-socket ceiling"
-assert_eq "$VM_MIN_FREE_KBYTES" "83886" "8 GiB adaptive min_free_kbytes"
 
 calculate_memory_buffer_cap 65536
 assert_eq "$MEM_TCP_BUDGET_MIB" "43690" "64 GiB aggregate TCP budget"
@@ -45,7 +44,7 @@ assert_eq "${CANDIDATE_FACTORS[*]}" "1.49 2.98 5.97" "actual candidate BDP ratio
 # candidate instead of stopping at the previous power of two.
 MEM_BUFFER_CAP_MIB="682"
 generate_candidates
-assert_eq "${CANDIDATE_MIBS[*]}" "32 64 128 256 512 682" "non-power-of-two final candidate"
+assert_eq "${CANDIDATE_MIBS[*]}" "32 64 128 172" "8 BDP experimental boundary"
 
 TARGET_MBPS="200"
 RTT_MS="30"
@@ -53,34 +52,30 @@ MEM_BUFFER_CAP_MIB="170"
 calculate_bdp
 assert_eq "$BDP_BYTES" "750000" "short-link BDP"
 generate_candidates
-assert_eq "${CANDIDATE_MIBS[*]}" "4 8 16 32 64 128 170" "growth continues to the calculated cap"
+assert_eq "${CANDIDATE_MIBS[*]}" "4 6" "short link stops at 8 BDP rather than all memory"
 
 
-# The generated profile includes the requested dedicated-proxy kernel, VM,
-# queue, TCP, PMTU, neighbour and ARP settings while keeping socket limits
-# tied to the measured candidate.
-TUNING_QDISC="cake"
+# Only TCP data-path knobs are mutable. Existing minima/defaults remain intact.
+TUNING_QDISC="fq"
 MEM_EFFECTIVE_MIB="8192"; MEM_TCP_BUDGET_MIB="5461"; MEM_BUFFER_CAP_MIB="2047"
-VM_MIN_FREE_KBYTES="83886"; TCP_MEM_LOW_PAGES="699050"; TCP_MEM_PRESSURE_PAGES="1048576"; TCP_MEM_HIGH_PAGES="1398101"
+TCP_MEM_LOW_PAGES="699050"; TCP_MEM_PRESSURE_PAGES="1048576"; TCP_MEM_HIGH_PAGES="1398101"
 TARGET_MBPS="1000"; RTT_MS="180"; BDP_MIB="21.46"
+TCP_RMIN=4096; TCP_RDEFAULT=131072; TCP_WMIN=8192; TCP_WDEFAULT=65536
 profile="$(build_sysctl_content 67108864)"
 for expected in \
-  'kernel.pid_max = 65535' \
-  'kernel.panic = 1' \
-  'vm.min_free_kbytes = 83886' \
-  'net.core.default_qdisc = cake' \
+  'net.core.default_qdisc = fq' \
   'net.core.rmem_max = 67108864' \
-  'net.ipv4.tcp_rmem = 8192 87380 67108864' \
+  'net.ipv4.tcp_rmem = 4096 131072 67108864' \
   'net.ipv4.tcp_wmem = 8192 65536 67108864' \
-  'net.ipv4.tcp_congestion_control = bbr' \
-  'net.ipv4.ip_local_port_range = 1024 65535' \
-  'net.ipv4.neigh.default.gc_thresh3 = 8192' \
-  'net.ipv4.conf.all.arp_ignore = 1'; do
+  'net.ipv4.tcp_congestion_control = bbr'; do
   grep -Fq "$expected" <<<"$profile" || fail "generated profile missing: $expected"
 done
-qdisc_safe cake || fail "CAKE must be recognised as a restorable queue discipline"
+if qdisc_safe cake; then fail "existing CAKE parameters cannot be assumed restorable"; fi
 for key in "${TUNING_SYSCTL_KEYS[@]}"; do
-  grep -Eq "^${key//./\.}[[:space:]]*=" <<<"$profile" || fail "managed key missing from generated profile: $key"
+  grep -Fq "$key = " <<<"$profile" || fail "managed key missing from generated profile: $key"
+done
+for disallowed in kernel. vm. tcp_fastopen tcp_fack tcp_adv_win_scale tcp_notsent_lowat tcp_fin_timeout rp_filter arp_ignore ip_local_port_range; do
+  if grep -v '^#' <<<"$profile" | grep -Fq "$disallowed"; then fail "unjustified change: $disallowed"; fi
 done
 
 # Unsupported kernel knobs are commented instead of aborting the profile.
