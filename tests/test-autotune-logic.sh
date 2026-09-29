@@ -169,7 +169,9 @@ forbidden='pro''mpt'
 if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohibited development wording"; fi
 
 # Simulate a complete balanced search: baseline pair, three growth candidates,
-# six backtracking candidates, and one final verification pair.
+# six backtracking candidates, and one final verification pair. Exercise both
+# managed fq and preserved CAKE through the complete search/report lifecycle.
+for simulated_qdisc in fq_codel cake; do
 (
   sim="$(mktemp -d)"
   trap 'rm -rf "$sim"' EXIT
@@ -182,8 +184,8 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   require_linux() { :; }; require_root() { :; }; have() { return 0; }; pending_guard() { :; }
   install_iperf3_if_needed() { :; }; install_python3_if_needed() { :; }; ensure_bbr() { :; }; schedule_rollback() { :; }
   resolve_iface() { echo eth0; }; guess_server_address() { echo speed.example.com; }; choose_random_port() { echo 34567; }
-  tc() { echo "qdisc fq_codel 0: root"; }
-  ip() { return 0; }; qdisc_layout_safe() { return 0; }; root_qdisc_kind() { echo fq_codel; }; apply_candidate() { :; }
+  tc() { echo "qdisc $simulated_qdisc 0: root"; }
+  ip() { return 0; }; qdisc_layout_safe() { [[ "$simulated_qdisc" != cake ]]; }; root_qdisc_kind() { echo "$simulated_qdisc"; }; apply_candidate() { :; }
   detect_memory_limits() {
     MEM_TOTAL_MIB=8192; MEM_AVAILABLE_MIB=4096; MEM_EFFECTIVE_MIB=8192
     MEM_TCP_BUDGET_MIB=5461; MEM_BUFFER_CAP_MIB=128; PAGE_SIZE_BYTES=4096
@@ -235,8 +237,8 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   [[ -s "$REPORT_FILE" ]] || fail "simulated results log"
   [[ -s "$COMPARISON_FILE" ]] || fail "simulated comparison log"
   [[ -s "$HISTORY_FILE" ]] || fail "simulated history log"
-  grep -q $'single\tbbr-fq\t1\t80' "$REPORT_FILE" || fail "single-connection candidate log"
-  grep -q $'multi\tbbr-fq\t8\t80' "$REPORT_FILE" || fail "multi-connection candidate log"
+  grep -q "$(printf 'single\tbbr-%s\t1\t80' "$TUNING_QDISC")" "$REPORT_FILE" || fail "single-connection candidate log"
+  grep -q "$(printf 'multi\tbbr-%s\t8\t80' "$TUNING_QDISC")" "$REPORT_FILE" || fail "multi-connection candidate log"
   grep -Fq '绝对目标未完全满足；已采用本次会话中单/多连接综合表现最优的候选' "$COMPARISON_FILE" || fail "best-effort report conclusion"
 
   awk -F '\t' 'NF!=19 {exit 1}' "$REPORT_FILE" || fail "results header/data width mismatch"
@@ -272,6 +274,13 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   grep -Fq '连续两档无显著评分收益' "$COMPARISON_FILE" || fail "plateau reason missing"
   awk -F '\t' 'NF!=19 {exit 1}' "$REPORT_FILE" || fail "plateau results schema mismatch"
   awk -F '\t' 'NF!=30 {exit 1}' "$HISTORY_FILE" || fail "plateau history schema mismatch"
+  if [[ "$simulated_qdisc" == cake ]]; then
+    assert_eq "$QDISC_POLICY" preserve "CAKE search preservation policy"
+    grep -Fqx 'BBR_QDISC_POLICY=preserve' "$ENV_FILE" || fail "CAKE boot policy not persisted"
+    grep -Fq '保留现有 CAKE' "$COMPARISON_FILE" || fail "CAKE report policy missing"
+    if grep -q 'bbr-fq' "$REPORT_FILE"; then fail "CAKE results mislabeled as fq"; fi
+    if grep -q '^net.core.default_qdisc' "$SYSCTL_FILE"; then fail "CAKE persistence changed default qdisc"; fi
+  fi
   # Valid baseline, then missing candidate telemetry in stable mode: this is
   # an invalid experiment, not an eligible best-effort performance result.
   if (
@@ -301,5 +310,6 @@ if grep -qi "$forbidden" "${ROOT}/bbr-tune.sh"; then fail "script contains prohi
   awk -F '\t' 'NF!=30 {exit 1}' "$HISTORY_FILE" || fail "upgraded history schema mismatch"
   rm -rf "$sim"
 )
+done
 
 printf 'All autotune logic tests passed.\n'

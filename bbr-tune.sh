@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.8.1"
+VERSION="2.8.2"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -50,6 +50,8 @@ TCP_WMIN=4096
 TCP_WDEFAULT=16384
 RULES_FILE=""
 TUNING_QDISC="fq"
+QDISC_POLICY="manage"
+PRESERVED_QDISC_LAYOUT=""
 PERSIST_FINAL="0"
 FORCE="0"
 YES="0"
@@ -299,7 +301,7 @@ usage() {
   --target-utilization N   达标吞吐百分比，默认 90
   --max-retrans-percent N  最大估算重传比例，默认 1
   --persist                最优参数复测后写入开机配置
-  --force                  允许覆盖无法完整恢复的自定义 root / 子队列
+  --force                  允许覆盖其他自定义队列；含 CAKE 的布局始终保留
 
 自动测试规则：
   1. 脚本只在远程 Linux 服务器修改 TCP/BBR 参数。
@@ -743,8 +745,45 @@ qdisc_preflight() {
 }
 
 select_tuning_qdisc() {
+  local layout
+  layout="$(qdisc_read_layout "$1")" || return 1
   TUNING_QDISC="fq"
-  modprobe sch_fq 2>/dev/null || true
+  QDISC_POLICY="manage"
+  PRESERVED_QDISC_LAYOUT=""
+  if awk '$2=="cake"{found=1} END{exit !found}' <<<"$layout"; then
+    # Preserve the entire tree, including non-CAKE siblings and parent shaping.
+    # BBR does not require replacing an existing traffic-management policy.
+    QDISC_POLICY="preserve"
+    TUNING_QDISC="$(awk '$1=="root"{print $2}' <<<"$layout")"
+    PRESERVED_QDISC_LAYOUT="$layout"
+    info "检测到 CAKE，保留现有队列及整形配置，仅调整 TCP/BBR 参数"
+  fi
+}
+
+qdisc_policy_summary() {
+  if [[ "$QDISC_POLICY" == preserve ]]; then
+    printf '保留现有 CAKE 队列及完整布局；不修改整形带宽、队列选项或系统默认队列'
+  else
+    printf '使用 fq；不设置整形带宽'
+  fi
+}
+
+verify_preserved_qdisc() {
+  local current
+  [[ -n "$PRESERVED_QDISC_LAYOUT" ]] || { qdisc_error '缺少原队列布局，无法验证保留状态'; return 1; }
+  current="$(qdisc_read_layout "$1")" || return 1
+  [[ "$(qdisc_shape "$current")" == "$(qdisc_shape "$PRESERVED_QDISC_LAYOUT")" ]] || {
+    qdisc_error '测速期间原队列布局已变化，停止本次候选；不会覆盖当前队列'; return 1;
+  }
+}
+
+apply_tuning_qdisc() {
+  if [[ "$QDISC_POLICY" == preserve ]]; then
+    verify_preserved_qdisc "$1" || return 1
+    printf '[QDISC] %s｜保留现有 CAKE 队列及完整布局，不修改整形参数\n' "$1"
+  else
+    apply_qdisc "$1" "$TUNING_QDISC"
+  fi
 }
 
 apply_qdisc() {
@@ -786,6 +825,13 @@ render_qdisc_helper() {
   declare -f qdisc_error qdisc_parse_layout qdisc_read_layout qdisc_safe qdisc_shape qdisc_can_apply_layout apply_qdisc
   cat <<'EOF_HELPER'
 source /etc/default/bbr-tcp-tuning
+case "${BBR_QDISC_POLICY:-manage}" in
+  preserve)
+    printf '[QDISC] 保留已有队列；开机队列配置继续由原网络服务管理\n'
+    exit 0 ;;
+  manage) ;;
+  *) qdisc_error '未知的开机队列策略，未修改任何队列'; exit 1 ;;
+esac
 iface="$BBR_IFACE"
 if [[ "$iface" == auto ]]; then
   iface="$(ip -o route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
@@ -808,13 +854,15 @@ prepare_tcp_rules() {
 build_sysctl_content() {
   local buffer_bytes="$1"
   (( buffer_bytes >= TCP_RDEFAULT && buffer_bytes >= TCP_WDEFAULT )) || return 1
+  if [[ "$QDISC_POLICY" != preserve ]]; then
+    printf 'net.core.default_qdisc = fq\n'
+  fi
   cat <<EOF_SYSCTL
 # Managed by bbr-tune.sh ${VERSION}; generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Strategy=${STRATEGY}; weights throughput/stability/retrans=${WEIGHT_SPEED}/${WEIGHT_STABILITY}/${WEIGHT_RETRANS}
 # Target=${TARGET_MBPS}Mbps, RTT=${RTT_MS}ms, BDP=${BDP_MIB}MiB
 # Socket maxima are measured candidates, NOT an egress rate limiter.
 # Keep original minima/defaults; kernel/VM/routing/application knobs are not throughput controls.
-net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = ${buffer_bytes}
 net.core.wmem_max = ${buffer_bytes}
@@ -865,7 +913,8 @@ TCP 参数决策依据
 BDP：${BDP_MIB} MiB；总内存技术上限：${MEM_BUFFER_CAP_MIB} MiB；本次搜索上限：${SEARCH_BUFFER_CAP_MIB} MiB。
 缓存：从约 1 BDP 开始，在不超过 8 BDP 和内存预算的范围内实测；原最小/默认值不变。
 扩容：只有评分未下降且尚未连续两档停滞才继续；发现回落后区间精调。
-恢复机制：BBR + fq；启用窗口缩放、接收自动调节与 SACK/DSACK。
+拥塞与恢复机制：BBR；启用窗口缩放、接收自动调节与 SACK/DSACK。
+队列策略：$(qdisc_policy_summary)。
 不调整：kernel.*、vm.*、rp_filter、ARP、邻居表、端口范围、连接重试/超时。
 保留原值：Fast Open、notsent_lowat、MTU probing、backlog；缺少应用支持或瓶颈证据不修改。
 不使用：已失效 tcp_fack、已废弃 tcp_adv_win_scale；不把通用 pacing 比率当作 BBR 增益。
@@ -906,7 +955,7 @@ ensure_bbr() {
   local available
   available="$(sysctl_get net.ipv4.tcp_available_congestion_control)"
   [[ " $available " == *" bbr "* ]] || die "当前内核不支持 BBR"
-  select_tuning_qdisc
+  if [[ "$QDISC_POLICY" == manage ]]; then modprobe sch_fq 2>/dev/null || true; fi
 }
 
 validate_candidate_kernel_state() {
@@ -924,7 +973,7 @@ validate_candidate_kernel_state() {
 apply_candidate() {
   local iface="$1" buffer_mib="$2" buffer_bytes
   buffer_bytes=$(( buffer_mib * 1048576 ))
-  apply_qdisc "$iface" fq || die "fq 队列未能安全应用，本候选未修改 TCP 参数"
+  apply_tuning_qdisc "$iface" || die "队列校验或应用失败，本候选未修改 TCP 参数"
   apply_sysctl_content "$buffer_bytes"
   validate_candidate_kernel_state "$buffer_bytes"
 }
@@ -944,17 +993,25 @@ write_persistent_config() {
   raw="$(mktemp)"; filtered="$(mktemp)"
   build_sysctl_content "$buffer_bytes" >"$raw"
   filter_supported_sysctl_file "$raw" "$filtered"
+  if [[ "$QDISC_POLICY" == preserve && -r "$SYSCTL_FILE" ]]; then
+    awk '/^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=/ {print}' "$SYSCTL_FILE" >>"$filtered"
+  fi
   atomic_write "$SYSCTL_FILE" 0644 <"$filtered"
   rm -f "$raw" "$filtered"
   {
     printf '# Managed by bbr-tune.sh\n'
     printf 'tcp_bbr\n'
-    printf 'sch_fq\n'
+    if [[ "$QDISC_POLICY" == manage ]]; then
+      printf 'sch_fq\n'
+    elif [[ -r "$MODULES_FILE" ]]; then
+      awk '$0!~/^[[:space:]]*tcp_bbr[[:space:]]*$/ {print}' "$MODULES_FILE"
+    fi
   } | atomic_write "$MODULES_FILE" 0644
   cat <<EOF_ENV | atomic_write "$ENV_FILE" 0644
 # Managed by bbr-tune.sh
 BBR_IFACE=$(printf '%q' "$iface")
 BBR_QDISC=$(printf '%q' "$TUNING_QDISC")
+BBR_QDISC_POLICY=$(printf '%q' "$QDISC_POLICY")
 EOF_ENV
   render_qdisc_helper | atomic_write "$QDISC_HELPER" 0755
   cat <<'EOF_SERVICE' | atomic_write "$SERVICE_FILE" 0644
@@ -975,6 +1032,8 @@ EOF_SERVICE
     systemctl daemon-reload
     systemctl enable bbr-tcp-tuning.service >/dev/null
     systemctl restart bbr-tcp-tuning.service
+  elif [[ "$QDISC_POLICY" == preserve ]]; then
+    info "TCP 开机配置已保存；现有 CAKE 队列的开机加载仍由原网络配置负责"
   else
     warn "当前未运行 systemd：sysctl 配置已保存，但 ${TUNING_QDISC} qdisc 需要自行设置开机任务"
   fi
@@ -1011,9 +1070,11 @@ IFACE=$(printf '%q' "$iface")
 ROOT_QDISC=$(printf '%q' "$(awk '$1=="root"{print $2}' <<<"$layout")")
 SERVICE_ENABLED=$(printf '%q' "$service_enabled")
 SERVICE_ACTIVE=$(printf '%q' "$service_active")
+QDISC_POLICY=$(printf '%q' "$QDISC_POLICY")
 EOF_META
   : >"${backup}/sysctl.tsv"
   for key in "${TUNING_SYSCTL_KEYS[@]}"; do
+    [[ "$QDISC_POLICY" != preserve || "$key" != net.core.default_qdisc ]] || continue
     if sysctl_exists "$key"; then
       value="$(sysctl_get "$key")"
       printf '%s\t%s\n' "$key" "$value" >>"${backup}/sysctl.tsv"
@@ -1049,6 +1110,13 @@ restore_qdisc() {
   read -r root handle <<<"$(awk '$1=="root"{print $2,$3}' <<<"$saved")"
   [[ -z "$recorded_kind" || "$root" == "$recorded_kind" ]] || { qdisc_error '队列备份与元数据不一致'; return 1; }
   current="$(qdisc_read_layout "$iface")" || return 1
+  if [[ "${4:-manage}" == preserve ]]; then
+    [[ "$(qdisc_shape "$saved")" == "$(qdisc_shape "$current")" ]] || {
+      qdisc_error '原队列布局已被其他操作改变；本次调优未修改队列，不执行覆盖恢复'; return 1;
+    }
+    printf '[QDISC] %s｜本次调优未修改队列，保留现有 CAKE 配置\n' "$iface"
+    return 0
+  fi
   if [[ "$(qdisc_shape "$saved")" == "$(qdisc_shape "$current")" ]]; then
     printf '[QDISC] %s｜队列布局与备份一致，保留现有队列\n' "$iface"
     return 0
@@ -1109,7 +1177,7 @@ restore_qdisc() {
 
 restore_backup() {
   local backup="$1" iface="" kind="" key value after failed=0
-  local IFACE="" ROOT_QDISC="" ROOT_QDISC_KIND="" SERVICE_ENABLED="unknown" SERVICE_ACTIVE="unknown"
+  local IFACE="" ROOT_QDISC="" ROOT_QDISC_KIND="" SERVICE_ENABLED="unknown" SERVICE_ACTIVE="unknown" QDISC_POLICY="manage"
   [[ -r "${backup}/meta.env" && -r "${backup}/sysctl.tsv" && -r "${backup}/files.tsv" ]] || {
     error "备份文件不完整：$backup"; return 1;
   }
@@ -1127,7 +1195,7 @@ restore_backup() {
       error "恢复读回不一致：${key}"; failed=1
     fi
   done <"${backup}/sysctl.tsv"
-  restore_qdisc "$backup" "$iface" "$kind" || { error "队列恢复失败：${iface}，详见 ${backup}/qdisc.txt"; failed=1; }
+  restore_qdisc "$backup" "$iface" "$kind" "$QDISC_POLICY" || { error "队列恢复失败：${iface}，详见 ${backup}/qdisc.txt"; failed=1; }
   if systemd_available; then
     systemctl daemon-reload >/dev/null 2>&1 || failed=1
     if [[ -f "$SERVICE_FILE" ]]; then
@@ -1985,7 +2053,7 @@ TCP 聚合内存预算：$(format_mib "$MEM_TCP_BUDGET_MIB")（有效总内存�
 链路 BDP：${BDP_MIB} MiB
 TCP 内存页阈值：${TCP_MEM_LOW_PAGES} / ${TCP_MEM_PRESSURE_PAGES} / ${TCP_MEM_HIGH_PAGES}
 本次缓存搜索上限：${SEARCH_BUFFER_CAP_MIB} MiB（8 BDP 实验边界与总内存技术上限取较小值）
-目标队列调度器：fq；不设置整形带宽；不覆盖已有 CAKE/自定义队列，除非显式 --force
+队列策略：$(qdisc_policy_summary)
 kernel / VM / 路由策略：保留会话开始时的值，不从下载测速推导系统级策略
 
 [5] 性能对比
@@ -2190,6 +2258,7 @@ autotune() {
   BEST_KIND="none"; BEST_BUFFER_MIB=0; BEST_FACTOR="未选择"; BEST_SCORE="-999999"; BEST_ELIGIBLE="no"; QOS_DETECTED=0
 
   detect_memory_limits
+  select_tuning_qdisc "$iface" || die "无法安全读取出口队列；尚未修改 TCP 参数"
   ensure_bbr
   prepare_tcp_rules
 
@@ -2201,10 +2270,14 @@ autotune() {
   BEFORE_BUFFER_BYTES="$(current_buffer_max)"
   BASELINE_BUFFER_BYTES="$BEFORE_BUFFER_BYTES"
   root_kind="$BEFORE_QDISC"
-  if ! qdisc_layout_safe "$iface" && (( ! FORCE )); then
-    die "检测到自定义队列布局（root qdisc 为 '${root_kind}'）；为避免破坏现有 QoS，需审计后使用 --force"
+  if [[ "$QDISC_POLICY" == preserve ]]; then
+    verify_preserved_qdisc "$iface" || die "原队列布局已变化；尚未开始测速或修改 TCP 参数"
+  else
+    if ! qdisc_layout_safe "$iface" && (( ! FORCE )); then
+      die "检测到自定义队列布局（root qdisc 为 '${root_kind}'）；为避免破坏现有 QoS，需审计后使用 --force"
+    fi
+    qdisc_preflight "$iface" "$TUNING_QDISC" || die "当前队列不适合安全自动调整；尚未开始测速或修改 TCP 参数"
   fi
-  qdisc_preflight "$iface" fq || die "当前队列不适合安全自动调整；尚未开始测速或修改 TCP 参数"
   capture_state "$iface" "${SESSION_DIR}/system-before.txt"
 
   section "自动优化会话 ${SESSION_ID}"
@@ -2219,7 +2292,8 @@ autotune() {
   printf '  随机测试端口：%s（%s）\n' "$TEST_PORT" "$([[ "$IPERF_FAMILY" == "-6" ]] && echo IPv6 || echo IPv4)"
   printf '  TCP 聚合内存预算：%s（有效总内存的 2/3）\n' "$(format_mib "$MEM_TCP_BUDGET_MIB")"
   printf '  单 socket 缓存技术上限：%s\n' "$(format_mib "$MEM_BUFFER_CAP_MIB")"
-  printf '  参数范围：BBR + fq / TCP 自动缓冲 / SACK；其余系统与网络策略保持原值\n'
+  printf '  参数范围：BBR / TCP 自动缓冲 / SACK；其余系统与网络策略保持原值\n'
+  printf '  队列策略：%s\n' "$(qdisc_policy_summary)"
   printf '  连接等待 / 安全回滚：%s 秒 / %s 秒\n' "$WAIT_SECONDS" "$AUTO_ROLLBACK_SECONDS"
   printf '  日志目录：%s\n\n' "$SESSION_DIR"
   warn "请确认云安全组和服务器防火墙允许 TCP ${TEST_PORT}；本工具不会修改本地电脑"
