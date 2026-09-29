@@ -36,6 +36,8 @@ while [[ ! -f "$STATE_DIR/release" ]]; do sleep 0.05; done
             time.sleep(0.05)
         tcp=subprocess.run([bash,'-c',prelude+'acquire_operation_lock','tcp',root,str(state)],env=env,capture_output=True,text=True)
         assert tcp.returncode!=0 and '正在运行' in tcp.stderr, tcp
+        queue=subprocess.run([bash,'-c',prelude+"main qdisc --qdisc cake",'queue',root,str(state)],env=env,capture_output=True,text=True)
+        assert queue.returncode!=0 and '正在运行' in queue.stderr,queue
         kernel=subprocess.run([bash,'-c','''source "$1/bbr-kernel.sh"
 K_ROOT="$2/kernels"
 k_lock
@@ -57,5 +59,5 @@ echo acquired >"$STATE_DIR/waiter"
         for child in (owner,waiter):
             if child is not None and child.poll() is None:
                 child.terminate(); child.communicate(timeout=5)
-print('All TCP/kernel mutual-exclusion and watchdog serialization tests passed.')
+print('All TCP/queue/kernel mutual-exclusion and watchdog serialization tests passed.')
 PY

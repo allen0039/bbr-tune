@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.8.2"
+VERSION="2.9.0"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -50,6 +50,13 @@ TCP_WMIN=4096
 TCP_WDEFAULT=16384
 RULES_FILE=""
 TUNING_QDISC="fq"
+REQUESTED_QDISC="auto"
+CAKE_BANDWIDTH_MBPS=""
+QUEUE_SWITCH_READY=0
+QDISC_ORIGINAL_JSON=""
+QDISC_ORIGINAL_PLAN=""
+QDISC_LAST_JSON=""
+QDISC_ONLY=0
 QDISC_POLICY="manage"
 PRESERVED_QDISC_LAYOUT=""
 PERSIST_FINAL="0"
@@ -282,6 +289,7 @@ usage() {
 用法：
   sudo ./bbr-tune.sh                         交互界面
   sudo ./bbr-tune.sh autotune [参数]         自动测试并选择最优参数
+  sudo ./bbr-tune.sh qdisc --qdisc ALGO      单独更改出口队列，不改 TCP 参数
   ./bbr-tune.sh status [--iface DEV]         查看当前 TCP/BBR 状态
   ./bbr-tune.sh history                      查看历史测试会话
   sudo ./bbr-tune.sh kernel [操作]         BBRv3 内核检测、安装、试用与恢复
@@ -293,6 +301,8 @@ usage() {
                            方向为“远程服务器 → 本地电脑”；通常填写
                            服务器出站上限与本地下载上限中的较小值
   --server-address HOST    本地 iperf3 应连接的服务器地址
+  --qdisc ALGO             auto 自动（默认）| keep 保留 | fq | fq_codel | cake
+  --cake-bandwidth-mbps N  CAKE 整形带宽；0 不限速；不填则保留已有值，新建时不限速
   --iface auto|DEV         出口网卡，默认自动识别
   --parallel N             多连接评估的并发流数，默认 8；单连接始终单独测试
   --duration N             每轮测试时长，默认 15 秒
@@ -301,7 +311,7 @@ usage() {
   --target-utilization N   达标吞吐百分比，默认 90
   --max-retrans-percent N  最大估算重传比例，默认 1
   --persist                最优参数复测后写入开机配置
-  --force                  允许覆盖其他自定义队列；含 CAKE 的布局始终保留
+  --force                  旧自动模式的自定义队列覆盖；显式切换仍须通过恢复预检
 
 自动测试规则：
   1. 脚本只在远程 Linux 服务器修改 TCP/BBR 参数。
@@ -333,7 +343,7 @@ parse_args() {
   fi
   case "$1" in
     kernel) COMMAND=kernel; shift; KERNEL_ARGS=("$@"); return ;;
-    menu|autotune|status|history|confirm|rollback|help) COMMAND="$1"; shift ;;
+    menu|autotune|qdisc|status|history|confirm|rollback|help) COMMAND="$1"; shift ;;
     --help|-h) COMMAND="help"; shift ;;
     --version) printf '%s %s\n' "$PROGRAM" "$VERSION"; exit 0 ;;
     *) die "未知命令：$1" ;;
@@ -343,6 +353,8 @@ parse_args() {
     case "$1" in
       --bandwidth-mbps) need_value "$@"; TARGET_MBPS="$2"; shift 2 ;;
       --server-address) need_value "$@"; SERVER_ADDRESS="$2"; shift 2 ;;
+      --qdisc) need_value "$@"; REQUESTED_QDISC="$2"; shift 2 ;;
+      --cake-bandwidth-mbps) need_value "$@"; CAKE_BANDWIDTH_MBPS="$2"; shift 2 ;;
       --iface) need_value "$@"; IFACE="$2"; shift 2 ;;
       --parallel) need_value "$@"; START_STREAMS="$2"; shift 2 ;;
       --duration) need_value "$@"; DURATION="$2"; shift 2 ;;
@@ -373,6 +385,7 @@ configure_strategy() {
 }
 
 validate_autotune_options() {
+  validate_qdisc_options
   configure_strategy
   local name value
   for name in START_STREAMS DURATION TEST_REPEATS; do
@@ -719,7 +732,7 @@ qdisc_can_apply_layout() {
   read -r root handle <<<"$(awk '$1=="root"{print $2,$3}' <<<"$layout")"
   while read -r parent kind unused; do
     [[ "$kind" != "$target" ]] || continue
-    if ! qdisc_safe "$kind" && [[ "${FORCE:-0}" != 1 ]]; then
+    if ! qdisc_safe "$kind" && [[ "${FORCE:-0}" != 1 && !( "$kind" == cake && "${QUEUE_SWITCH_READY:-0}" == 1 ) ]]; then
       qdisc_error "${parent} 上的 ${kind} 不是默认队列，保持原有 QoS 配置"
       return 1
     fi
@@ -744,27 +757,297 @@ qdisc_preflight() {
   qdisc_can_apply_layout "$layout" "$2"
 }
 
+validate_qdisc_options() {
+  case "$REQUESTED_QDISC" in auto|keep|fq|fq_codel|cake) ;;
+    *) die "队列算法必须是 auto、keep、fq、fq_codel 或 cake" ;;
+  esac
+  if [[ -n "$CAKE_BANDWIDTH_MBPS" ]]; then
+    [[ "$REQUESTED_QDISC" == cake ]] || die "--cake-bandwidth-mbps 仅可与 --qdisc cake 一起使用"
+    is_number "$CAKE_BANDWIDTH_MBPS" && awk -v v="$CAKE_BANDWIDTH_MBPS" 'BEGIN{exit !(v==0 || (v>=0.001 && v<=100000))}' || die "CAKE 整形带宽必须为 0 或 0.001～100000 Mbps；0 表示不限速"
+  fi
+}
+
+# Serialize only documented, reversible options from numeric tc JSON. Unknown
+# options fail closed; no shell evaluation or rounded display values are used.
+qdisc_json() {
+  python3 - "$@" <<'PY_QDISC'
+import json, sys, re
+from decimal import Decimal
+
+def ident(s):
+    if not isinstance(s,str) or not re.fullmatch(r'[0-9a-fA-F]*:[0-9a-fA-F]*',s):
+        raise ValueError('invalid qdisc handle')
+    a,b=s.split(':'); return f'{int(a or "0",16):x}:' + (f'{int(b,16):x}' if b else '')
+
+def load(path):
+    data=json.load(open(path)); result={}
+    if not isinstance(data,list): raise ValueError('tc JSON must be an array')
+    for q in data:
+        kind=q['kind']
+        if kind in ('ingress','clsact'): continue
+        if kind not in ('mq','noqueue','fq','fq_codel','cake'): raise ValueError(f'unsupported original queue: {kind}')
+        if q.get('ingress_block') or q.get('egress_block') or q.get('offloaded'):
+            raise ValueError('shared blocks or offloaded qdisc cannot be switched')
+        parent='root' if q.get('root') else ident(q.get('parent'))
+        if parent in result: raise ValueError('duplicate attachment')
+        result[parent]={'kind':kind,'handle':ident(q['handle']),'options':q.get('options',{})}
+        options(result[parent])
+    if 'root' not in result: raise ValueError('missing root')
+    root=result['root']
+    if root['kind']=='mq':
+        if len(result)<2: raise ValueError('empty mq')
+        for p in result:
+            if p!='root' and p.split(':')[0]+':'!=root['handle']: raise ValueError('mq parent mismatch')
+    elif len(result)!=1: raise ValueError('custom hierarchical queues require keep')
+    return result
+
+def integer(v):
+    if type(v)!=int or not 0<=v<=2**64-1: raise ValueError('invalid numeric option')
+    return str(v)
+
+def fwmark(v):
+    # tc emits hexadecimal JSON strings (including "0"), not just integers.
+    if isinstance(v,str) and re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|[0-9]+)',v):
+        v=int(v,16 if v.lower().startswith('0x') else 10)
+    if type(v)!=int or not 0<=v<=2**32-1: raise ValueError('invalid CAKE fwmark')
+    return v
+
+def options(q):
+    kind=q['kind']; o=q['options']
+    if not isinstance(o,dict): raise ValueError('invalid options')
+    args=[]; known=set()
+    def number(key,unit='',scale=1):
+        known.add(key)
+        if key in o: args.extend([key,str(int(integer(o[key]))*scale)+unit])
+    def boolean(key,on,off):
+        known.add(key)
+        if key in o:
+            if type(o[key])!=bool: raise ValueError('invalid boolean option')
+            args.append(on if o[key] else off)
+    def enum(key,allowed):
+        known.add(key)
+        if key in o:
+            if o[key] not in allowed: raise ValueError(f'unsupported {key}: {o[key]}')
+            args.append(o[key])
+    if kind=='fq':
+        for k in ('limit','flow_limit','buckets','orphan_mask','quantum','initial_quantum'): number(k)
+        for k in ('maxrate','defrate','low_rate_threshold'): number(k,'bit',8)
+        for k in ('refill_delay','ce_threshold','horizon'): number(k,'us')
+        number('timer_slack','ns'); boolean('pacing','pacing','nopacing')
+        if 'pacing' not in o: args.append('pacing')
+        for k in ('horizon_cap','horizon_drop'):
+            known.add(k)
+            if k in o:
+                if o[k] is not None: raise ValueError('invalid horizon mode')
+                args.append(k)
+    elif kind=='fq_codel':
+        for k in ('limit','flows','quantum','memory_limit','drop_batch'): number(k)
+        for k in ('target','interval','ce_threshold'): number(k,'us')
+        boolean('ecn','ecn','noecn')
+        if 'ecn' not in o: args.append('noecn')
+        known.update(('ce_threshold_selector','ce_threshold_mask'))
+        if 'ce_threshold_selector' in o or 'ce_threshold_mask' in o:
+            args += ['ce_threshold_selector',integer(o['ce_threshold_selector'])+'/'+integer(o['ce_threshold_mask'])]
+    elif kind=='cake':
+        known.add('bandwidth')
+        if 'bandwidth' not in o: raise ValueError('CAKE bandwidth missing')
+        if o['bandwidth']=='unlimited': args.append('unlimited')
+        else: args += ['bandwidth',str(int(integer(o['bandwidth']))*8)+'bit']
+        enum('autorate',('autorate-ingress',))
+        enum('diffserv',('besteffort','diffserv3','diffserv4','diffserv8'))
+        enum('flowmode',('flowblind','srchost','dsthost','hosts','flows','dual-srchost','dual-dsthost','triple-isolate'))
+        for k,on,off in [('nat','nat','nonat'),('wash','wash','nowash'),('ingress','ingress','egress'),('split_gso','split-gso','no-split-gso')]: boolean(k,on,off)
+        known.add('ack-filter')
+        if 'ack-filter' in o:
+            args.append({'disabled':'no-ack-filter','enabled':'ack-filter','aggressive':'ack-filter-aggressive'}[o['ack-filter']])
+        number('rtt','us'); known.add('raw')
+        if o.get('raw') is True: args.append('raw')
+        elif o.get('raw',False) is not False: raise ValueError('invalid raw flag')
+        enum('atm',('atm','ptm','noatm'))
+        known.add('overhead')
+        if 'overhead' in o:
+            if type(o['overhead'])!=int: raise ValueError('invalid overhead')
+            args += ['overhead',str(o['overhead'])]
+        for k in ('mpu','memlimit'): number(k)
+        known.add('fwmark')
+        if 'fwmark' in o: args += ['fwmark',hex(fwmark(o['fwmark']))]
+    unknown=set(o)-known
+    if unknown: raise ValueError('unrecognized options: '+','.join(sorted(unknown)))
+    return args
+
+def normalized(q):
+    o=dict(q['options'])
+    if q['kind']=='fq': o.setdefault('pacing',True)
+    if q['kind']=='fq_codel': o.setdefault('ecn',False)
+    if q['kind']=='cake': o['fwmark']=fwmark(o.get('fwmark',0))
+    return q['kind'],o
+
+try:
+    mode=sys.argv[1]
+    if mode=='filters':
+        if json.load(open(sys.argv[2]))!=[]: raise ValueError('existing egress filters require keep')
+    else:
+        d=load(sys.argv[2])
+        if mode=='plan':
+            for p,q in sorted(d.items()): print('\t'.join((p,q['kind'],q['handle'],' '.join(options(q)))))
+        elif mode=='equal':
+            other=load(sys.argv[3]); ok=d.keys()==other.keys()
+            for p,q in d.items():
+                n=other.get(p,{})
+                ok=ok and bool(n) and normalized(q)==normalized(n)
+                if q['handle']!='0:': ok=ok and q['handle']==n.get('handle')
+            sys.exit(0 if ok else 1)
+        elif mode=='record-equal':
+            original=d[sys.argv[3]]; sample=load(sys.argv[4]).get(sys.argv[3])
+            ok=sample is not None and normalized(original)==normalized(sample)
+            if original['handle']!='0:': ok=ok and original['handle']==sample.get('handle')
+            sys.exit(0 if ok else 1)
+        elif mode=='probe':
+            original=d[sys.argv[3]]; sample=load(sys.argv[4])['root']
+            if normalized(original)!=normalized(sample): raise ValueError('kernel did not reproduce original options')
+        elif mode=='matches':
+            target=sys.argv[3]; bw=sys.argv[4]; leaves=[q for p,q in d.items() if p!='root' or q['kind']!='mq']
+            ok=all(q['kind']==target for q in leaves)
+            if bw and target=='cake':
+                rate=int(Decimal(bw)*Decimal(1000000)/8)
+                ok=ok and all(q['options'].get('bandwidth')==('unlimited' if rate==0 else rate) and not q['options'].get('autorate') for q in leaves)
+            sys.exit(0 if ok else 1)
+        else: raise ValueError('unknown qdisc operation')
+except (ValueError,KeyError,TypeError,OSError,json.JSONDecodeError) as exc:
+    print('队列配置无法安全解析或重建：'+str(exc),file=sys.stderr); sys.exit(2)
+PY_QDISC
+}
+
+qdisc_target_args() {
+  QDISC_ARGS=()
+  if [[ "$TUNING_QDISC" == cake ]]; then
+    if [[ -n "$CAKE_BANDWIDTH_MBPS" ]] && awk -v b="$CAKE_BANDWIDTH_MBPS" 'BEGIN{exit !(b>0)}'; then
+      QDISC_ARGS=(bandwidth "${CAKE_BANDWIDTH_MBPS}mbit")
+    else
+      QDISC_ARGS=(unlimited)
+    fi
+  fi
+}
+
+# Probe support and both directions of the switch on an isolated dummy device,
+# never on the live interface. Lack of namespace privileges fails before writes.
+qdisc_switch_probe() (
+  local ns="bbrq-$$-${RANDOM}" created=0 parent kind handle text
+  local opts=()
+  trap '(( ! created )) || ip netns del "$ns" >/dev/null 2>&1' EXIT
+  trap 'exit 130' INT TERM HUP
+  ip netns add "$ns" || { qdisc_error '无法创建临时网络命名空间；请使用 --qdisc keep，或在有完整网络管理权限的宿主机切换'; return 1; }
+  created=1
+  ip -n "$ns" link add bbrprobe type dummy || return 1
+  qdisc_target_args
+  ip netns exec "$ns" tc qdisc replace dev bbrprobe root "$TUNING_QDISC" ${QDISC_ARGS[@]+"${QDISC_ARGS[@]}"} || return 1
+  ip netns exec "$ns" tc -j -d qdisc show dev bbrprobe >"${SESSION_DIR}/qdisc-probe.json" || return 1
+  qdisc_json matches "${SESSION_DIR}/qdisc-probe.json" "$TUNING_QDISC" "$CAKE_BANDWIDTH_MBPS" || return 1
+  while IFS=$'\t' read -r parent kind handle text; do
+    [[ "$kind" != mq && "$kind" != noqueue ]] || continue
+    opts=(); [[ -z "$text" ]] || read -r -a opts <<<"$text"
+    ip netns exec "$ns" tc qdisc replace dev bbrprobe root "$kind" ${opts[@]+"${opts[@]}"} || return 1
+    ip netns exec "$ns" tc -j -d qdisc show dev bbrprobe >"${SESSION_DIR}/qdisc-probe.json" || return 1
+    qdisc_json probe "$QDISC_ORIGINAL_JSON" "$parent" "${SESSION_DIR}/qdisc-probe.json" || return 1
+    ip netns exec "$ns" tc qdisc replace dev bbrprobe root "$TUNING_QDISC" ${QDISC_ARGS[@]+"${QDISC_ARGS[@]}"} || return 1
+    ip netns exec "$ns" tc -j -d qdisc show dev bbrprobe >"${SESSION_DIR}/qdisc-probe.json" || return 1
+    qdisc_json matches "${SESSION_DIR}/qdisc-probe.json" "$TUNING_QDISC" "$CAKE_BANDWIDTH_MBPS" || return 1
+    ip netns exec "$ns" tc qdisc replace dev bbrprobe root "$kind" ${opts[@]+"${opts[@]}"} || return 1
+    ip netns exec "$ns" tc -j -d qdisc show dev bbrprobe >"${SESSION_DIR}/qdisc-probe.json" || return 1
+    qdisc_json probe "$QDISC_ORIGINAL_JSON" "$parent" "${SESSION_DIR}/qdisc-probe.json" || return 1
+  done <"$QDISC_ORIGINAL_PLAN"
+)
+
+prepare_qdisc_switch() {
+  local iface="$1" parent kind handle text layout
+  local attachment=()
+  QDISC_ORIGINAL_JSON="${SESSION_DIR}/qdisc-original.json"
+  QDISC_ORIGINAL_PLAN="${SESSION_DIR}/qdisc-original.tsv"
+  tc -j -d qdisc show dev "$iface" >"$QDISC_ORIGINAL_JSON" || return 1
+  qdisc_json plan "$QDISC_ORIGINAL_JSON" >"$QDISC_ORIGINAL_PLAN" || return 1
+  layout="$(qdisc_read_layout "$iface")" || return 1
+  if [[ "$TUNING_QDISC" == cake && -n "$CAKE_BANDWIDTH_MBPS" && "$(awk '$1=="root"{print $2}' <<<"$layout")" == mq ]]; then
+    qdisc_error 'mq 每个发送队列独立运行；不能把网卡总整形带宽重复设置到各子队列，请留空 CAKE 带宽或选择 keep'
+    return 1
+  fi
+  # Explicit selection authorizes replacing supported CAKE, never unknown trees.
+  QUEUE_SWITCH_READY=1
+  qdisc_preflight "$iface" "$TUNING_QDISC" || return 1
+  if qdisc_json matches "$QDISC_ORIGINAL_JSON" "$TUNING_QDISC" "$CAKE_BANDWIDTH_MBPS"; then return 0; fi
+  while IFS=$'\t' read -r parent kind handle text; do
+    if [[ "$parent" == root ]]; then attachment=(root); else attachment=(parent "$parent"); fi
+    tc -j filter show dev "$iface" "${attachment[@]}" >"${SESSION_DIR}/qdisc-filters.json" || return 1
+    qdisc_json filters "${SESSION_DIR}/qdisc-filters.json" || return 1
+  done <"$QDISC_ORIGINAL_PLAN"
+  qdisc_switch_probe >"${SESSION_DIR}/qdisc-probe.log" 2>&1 || {
+    cat "${SESSION_DIR}/qdisc-probe.log" >&2
+    qdisc_error '队列切换或原配置恢复预检失败，尚未修改出口队列；请使用 keep 或查看 qdisc-probe.log'; return 1;
+  }
+}
+
+restore_qdisc_exact() {
+  local backup="$1" iface="$2" parent kind handle text current saved after
+  local opts=() cmd=()
+  saved="$(qdisc_parse_layout <"${backup}/qdisc.txt")" || return 1
+  current="$(qdisc_read_layout "$iface")" || return 1
+  if [[ "$(awk '$1=="root"{print $2}' <<<"$saved")" == mq ]]; then
+    [[ "$(awk '$1=="root"{print $2,$3}' <<<"$saved")" == "$(awk '$1=="root"{print $2,$3}' <<<"$current")" && "$(awk '{print $1}' <<<"$saved")" == "$(awk '{print $1}' <<<"$current")" ]] || {
+      qdisc_error 'mq 布局已变化，未重建根队列'; return 1;
+    }
+  elif [[ "$(wc -l <<<"$current" | tr -d ' ')" != 1 ]]; then
+    qdisc_error '当前队列已变为分层布局，未执行覆盖恢复'; return 1
+  fi
+  tc -j -d qdisc show dev "$iface" >"${backup}/qdisc-current.json" || return 1
+  qdisc_json plan "${backup}/qdisc-current.json" >"${backup}/qdisc-current.tsv" || return 1
+  if qdisc_json equal "${backup}/qdisc-original.json" "${backup}/qdisc-current.json"; then return 0; fi
+  [[ -f "${backup}/qdisc-changed" ]] || { qdisc_error '本次尚未修改队列；当前队列被其他操作改变，保持不动'; return 1; }
+  qdisc_json plan "${backup}/qdisc-original.json" >"${backup}/qdisc-restore.tsv" || return 1
+  while IFS=$'\t' read -r parent kind handle text; do
+    [[ "$kind" != mq ]] || continue
+    if qdisc_json record-equal "${backup}/qdisc-original.json" "$parent" "${backup}/qdisc-current.json"; then continue; fi
+    cmd=(tc qdisc replace dev "$iface")
+    if [[ "$parent" == root ]]; then cmd+=(root); else cmd+=(parent "$parent"); fi
+    [[ "$handle" == 0: ]] || cmd+=(handle "$handle")
+    opts=(); [[ -z "$text" ]] || read -r -a opts <<<"$text"
+    if [[ "$kind" == noqueue ]]; then tc qdisc del dev "$iface" root || return 1
+    else "${cmd[@]}" "$kind" ${opts[@]+"${opts[@]}"} || return 1; fi
+  done <"${backup}/qdisc-restore.tsv"
+  tc -j -d qdisc show dev "$iface" >"${backup}/qdisc-restored.json" || return 1
+  qdisc_json equal "${backup}/qdisc-original.json" "${backup}/qdisc-restored.json" || { qdisc_error '队列恢复读回与原配置不一致'; return 1; }
+}
+
 select_tuning_qdisc() {
   local layout
   layout="$(qdisc_read_layout "$1")" || return 1
-  TUNING_QDISC="fq"
-  QDISC_POLICY="manage"
-  PRESERVED_QDISC_LAYOUT=""
-  if awk '$2=="cake"{found=1} END{exit !found}' <<<"$layout"; then
-    # Preserve the entire tree, including non-CAKE siblings and parent shaping.
-    # BBR does not require replacing an existing traffic-management policy.
+  TUNING_QDISC="fq"; QDISC_POLICY="manage"; PRESERVED_QDISC_LAYOUT=""
+  QUEUE_SWITCH_READY=0; QDISC_ORIGINAL_JSON=""; QDISC_ORIGINAL_PLAN=""; QDISC_LAST_JSON=""
+  if [[ "$REQUESTED_QDISC" == keep ]] || { [[ "$REQUESTED_QDISC" == auto ]] && awk '$2=="cake"{found=1} END{exit !found}' <<<"$layout"; }; then
     QDISC_POLICY="preserve"
     TUNING_QDISC="$(awk '$1=="root"{print $2}' <<<"$layout")"
     PRESERVED_QDISC_LAYOUT="$layout"
-    info "检测到 CAKE，保留现有队列及整形配置，仅调整 TCP/BBR 参数"
+    info "保留现有队列及整形配置，仅调整 TCP/BBR 参数"
+  elif [[ "$REQUESTED_QDISC" != auto ]]; then
+    TUNING_QDISC="$REQUESTED_QDISC"
+    prepare_qdisc_switch "$1" || return 1
   fi
 }
 
 qdisc_policy_summary() {
   if [[ "$QDISC_POLICY" == preserve ]]; then
-    printf '保留现有 CAKE 队列及完整布局；不修改整形带宽、队列选项或系统默认队列'
+    if [[ "$REQUESTED_QDISC" == keep ]]; then
+      printf '保留现有队列及完整布局；不修改整形带宽、队列选项或系统默认队列'
+    else
+      printf '保留现有 CAKE 队列及完整布局；不修改整形带宽、队列选项或系统默认队列'
+    fi
   else
-    printf '使用 fq；不设置整形带宽'
+    printf '使用 %s' "$TUNING_QDISC"
+    if [[ "$TUNING_QDISC" == cake ]]; then
+      if [[ -z "$CAKE_BANDWIDTH_MBPS" ]]; then
+        printf '；CAKE 整形带宽：保留已有设置，新建时不限速'
+      elif awk -v b="$CAKE_BANDWIDTH_MBPS" 'BEGIN{exit !(b==0)}'; then
+        printf '；CAKE 整形带宽：不限速'
+      else printf '；CAKE 整形带宽：%s Mbps' "$CAKE_BANDWIDTH_MBPS"; fi
+    else printf '；不设置整形带宽'; fi
   fi
 }
 
@@ -780,10 +1063,46 @@ verify_preserved_qdisc() {
 apply_tuning_qdisc() {
   if [[ "$QDISC_POLICY" == preserve ]]; then
     verify_preserved_qdisc "$1" || return 1
-    printf '[QDISC] %s｜保留现有 CAKE 队列及完整布局，不修改整形参数\n' "$1"
+    printf '[QDISC] %s｜保留现有队列布局，不修改整形参数\n' "$1"
   else
-    apply_qdisc "$1" "$TUNING_QDISC"
+    if [[ -n "$QDISC_ORIGINAL_JSON" ]]; then
+      tc -j -d qdisc show dev "$1" >"${SESSION_DIR}/qdisc-before-apply.json" || return 1
+      qdisc_json equal "${QDISC_LAST_JSON:-$QDISC_ORIGINAL_JSON}" "${SESSION_DIR}/qdisc-before-apply.json" || {
+        qdisc_error '原队列配置已变化，未执行本次切换'; return 1;
+      }
+      [[ -z "$BACKUP_DIR" ]] || touch "${BACKUP_DIR}/qdisc-changed"
+    fi
+    apply_qdisc "$1" "$TUNING_QDISC" || return 1
+    if [[ -n "$QDISC_ORIGINAL_JSON" ]]; then
+      QDISC_LAST_JSON="${SESSION_DIR}/qdisc-applied.json"
+      tc -j -d qdisc show dev "$1" >"$QDISC_LAST_JSON" || return 1
+      qdisc_json matches "$QDISC_LAST_JSON" "$TUNING_QDISC" "$CAKE_BANDWIDTH_MBPS" || return 1
+    fi
   fi
+}
+
+apply_qdisc_leaf() {
+  local iface="$1" parent="$2" before="$3" target="$4" operation=replace
+  local attachment=() args=()
+  if [[ "$parent" == root ]]; then attachment=(root); else attachment=(parent "$parent"); fi
+  if [[ "$before" == "$target" ]]; then
+    [[ "$target" == cake && -n "${CAKE_BANDWIDTH_MBPS:-}" ]] || return 0
+    if [[ "$parent" == root ]]; then
+      local snapshot
+      snapshot="$(mktemp)"
+      if tc -j -d qdisc show dev "$iface" >"$snapshot" && qdisc_json matches "$snapshot" cake "$CAKE_BANDWIDTH_MBPS"; then
+        rm -f "$snapshot"; return 0
+      fi
+      rm -f "$snapshot"
+    fi
+    operation=change
+  fi
+  if [[ "$target" == cake ]]; then
+    if [[ -n "${CAKE_BANDWIDTH_MBPS:-}" ]] && awk -v b="$CAKE_BANDWIDTH_MBPS" 'BEGIN{exit !(b>0)}'; then
+      args=(bandwidth "${CAKE_BANDWIDTH_MBPS}mbit")
+    else args=(unlimited); fi
+  fi
+  tc qdisc "$operation" dev "$iface" "${attachment[@]}" "$target" ${args[@]+"${args[@]}"}
 }
 
 apply_qdisc() {
@@ -792,39 +1111,73 @@ apply_qdisc() {
   qdisc_can_apply_layout "$before" "$target" || return 1
   read -r root handle <<<"$(awk '$1=="root"{print $2,$3}' <<<"$before")"
   if [[ "$root" == mq ]]; then
+    [[ -z "${CAKE_BANDWIDTH_MBPS:-}" || "$target" != cake ]] || { qdisc_error 'mq 不支持设置整张网卡的 CAKE 整形带宽'; return 1; }
     expected="$(awk -v target="$target" 'BEGIN{OFS="\t"} $1!="root"{$2=target} {print $1,$2,$3}' <<<"$before")"
     if [[ "$(qdisc_shape "$before")" == "$(qdisc_shape "$expected")" ]]; then
-      printf '[QDISC] %s｜保留 mq %s；%s 个子队列已为 %s，无需替换\n' "$iface" "$handle" "$(awk '$1!="root"{n++} END{print n+0}' <<<"$before")" "$target"
+      printf '[QDISC] %s｜保留 mq %s；子队列已为 %s，无需替换\n' "$iface" "$handle" "$target"
       return 0
     fi
     while read -r parent kind unused; do
-      [[ "$parent" != root && "$kind" != "$target" ]] || continue
-      tc qdisc replace dev "$iface" parent "$parent" "$target" || {
-        qdisc_error "${iface} 子队列 ${parent} 切换为 ${target} 失败；未删除根队列"; return 1;
-      }
+      [[ "$parent" != root ]] || continue
+      apply_qdisc_leaf "$iface" "$parent" "$kind" "$target" || return 1
     done <<<"$before"
     after="$(qdisc_read_layout "$iface")" || return 1
-    [[ "$(qdisc_shape "$after")" == "$(qdisc_shape "$expected")" ]] || {
-      qdisc_error "${iface} 多队列读回结果与预期不一致"; return 1;
-    }
+    [[ "$(qdisc_shape "$after")" == "$(qdisc_shape "$expected")" ]] || { qdisc_error '多队列读回结果与预期不一致'; return 1; }
   else
-    if [[ "$root" == "$target" ]]; then
-      printf '[QDISC] %s｜根队列已为 %s，无需替换\n' "$iface" "$target"
-      return 0
-    fi
-    tc qdisc replace dev "$iface" root "$target" || return 1
+    apply_qdisc_leaf "$iface" root "$root" "$target" || return 1
     after="$(qdisc_read_layout "$iface")" || return 1
-    [[ "$(awk '{print $1,$2}' <<<"$after")" == "root $target" ]] || {
-      qdisc_error "${iface} 根队列读回结果与预期不一致"; return 1;
-    }
+    [[ "$(awk '{print $1,$2}' <<<"$after")" == "root $target" ]] || { qdisc_error '根队列读回结果与预期不一致'; return 1; }
   fi
+  if [[ "$target" == cake && -n "${CAKE_BANDWIDTH_MBPS:-}" ]]; then
+    local snapshot
+    snapshot="$(mktemp)"
+    if ! tc -j -d qdisc show dev "$iface" >"$snapshot" || ! qdisc_json matches "$snapshot" cake "$CAKE_BANDWIDTH_MBPS"; then
+      rm -f "$snapshot"; qdisc_error 'CAKE 带宽读回与请求值不一致'; return 1
+    fi
+    rm -f "$snapshot"
+  fi
+}
+
+apply_boot_qdisc() {
+  local iface="$1" target="$2"
+  if [[ "${BBR_QDISC_EXPLICIT:-0}" != 1 ]]; then
+    apply_qdisc "$iface" "$target"
+    return
+  fi
+  # Explicit persistent selections may replace CAKE, but only after taking a
+  # fresh snapshot and verifying recovery on this boot, under the writer lock.
+  local state="${BBR_QDISC_STATE_DIR:-/var/lib/bbr-tcp-tuning}"
+  local SESSION_DIR QDISC_ORIGINAL_JSON="" QDISC_ORIGINAL_PLAN="" QUEUE_SWITCH_READY=0
+  local TUNING_QDISC="$target" FORCE=0
+  umask 077
+  mkdir -p "$state" || return 1
+  exec 8>"${state}/operation.lock" || return 1
+  flock -n 8 || { qdisc_error 'TCP 或队列操作正在运行，本次开机加载未修改队列'; return 1; }
+  mkdir -p "${state}/queue-boot" || return 1
+  SESSION_DIR="$(mktemp -d "${state}/queue-boot/$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
+  prepare_qdisc_switch "$iface" || return 1
+  tc -s -d qdisc show dev "$iface" >"${SESSION_DIR}/qdisc.txt" || return 1
+  tc -j -d qdisc show dev "$iface" >"${SESSION_DIR}/qdisc-before-apply.json" || return 1
+  qdisc_json equal "$QDISC_ORIGINAL_JSON" "${SESSION_DIR}/qdisc-before-apply.json" || {
+    qdisc_error '开机检查期间队列配置已变化，未执行切换'; return 1;
+  }
+  touch "${SESSION_DIR}/qdisc-changed" || return 1
+  if apply_qdisc "$iface" "$target" &&
+      tc -j -d qdisc show dev "$iface" >"${SESSION_DIR}/qdisc-applied.json" &&
+      qdisc_json matches "${SESSION_DIR}/qdisc-applied.json" "$target" "$CAKE_BANDWIDTH_MBPS"; then
+    return 0
+  fi
+  qdisc_error "开机队列应用失败，正在恢复本次快照：${SESSION_DIR}"
+  restore_qdisc_exact "$SESSION_DIR" "$iface" || qdisc_error "恢复未完成，请通过控制台检查 ${SESSION_DIR}"
+  return 1
 }
 
 render_qdisc_helper() {
   printf '#!/usr/bin/env bash\n# Managed by bbr-tune.sh\nset -Eeuo pipefail\n'
-  declare -f qdisc_error qdisc_parse_layout qdisc_read_layout qdisc_safe qdisc_shape qdisc_can_apply_layout apply_qdisc
+  declare -f qdisc_error qdisc_parse_layout qdisc_read_layout qdisc_safe qdisc_shape qdisc_can_apply_layout qdisc_preflight qdisc_json qdisc_target_args qdisc_switch_probe prepare_qdisc_switch restore_qdisc_exact apply_qdisc_leaf apply_qdisc apply_boot_qdisc
   cat <<'EOF_HELPER'
 source /etc/default/bbr-tcp-tuning
+CAKE_BANDWIDTH_MBPS="${BBR_CAKE_BANDWIDTH_MBPS:-}"
 case "${BBR_QDISC_POLICY:-manage}" in
   preserve)
     printf '[QDISC] 保留已有队列；开机队列配置继续由原网络服务管理\n'
@@ -837,7 +1190,7 @@ if [[ "$iface" == auto ]]; then
   iface="$(ip -o route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 fi
 [[ -n "$iface" ]] || { qdisc_error '无法识别出口网卡'; exit 1; }
-apply_qdisc "$iface" "${BBR_QDISC:-fq}"
+apply_boot_qdisc "$iface" "${BBR_QDISC:-fq}"
 EOF_HELPER
 }
 
@@ -855,7 +1208,7 @@ build_sysctl_content() {
   local buffer_bytes="$1"
   (( buffer_bytes >= TCP_RDEFAULT && buffer_bytes >= TCP_WDEFAULT )) || return 1
   if [[ "$QDISC_POLICY" != preserve ]]; then
-    printf 'net.core.default_qdisc = fq\n'
+    printf 'net.core.default_qdisc = %s\n' "$TUNING_QDISC"
   fi
   cat <<EOF_SYSCTL
 # Managed by bbr-tune.sh ${VERSION}; generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -955,7 +1308,7 @@ ensure_bbr() {
   local available
   available="$(sysctl_get net.ipv4.tcp_available_congestion_control)"
   [[ " $available " == *" bbr "* ]] || die "当前内核不支持 BBR"
-  if [[ "$QDISC_POLICY" == manage ]]; then modprobe sch_fq 2>/dev/null || true; fi
+  if [[ "$QDISC_POLICY" == manage ]]; then modprobe "sch_${TUNING_QDISC}" 2>/dev/null || true; fi
 }
 
 validate_candidate_kernel_state() {
@@ -998,11 +1351,16 @@ write_persistent_config() {
   fi
   atomic_write "$SYSCTL_FILE" 0644 <"$filtered"
   rm -f "$raw" "$filtered"
+  write_qdisc_persistence "$iface"
+}
+
+write_qdisc_persistence() {
+  local iface="$1"
   {
     printf '# Managed by bbr-tune.sh\n'
     printf 'tcp_bbr\n'
     if [[ "$QDISC_POLICY" == manage ]]; then
-      printf 'sch_fq\n'
+      printf 'sch_%s\n' "$TUNING_QDISC"
     elif [[ -r "$MODULES_FILE" ]]; then
       awk '$0!~/^[[:space:]]*tcp_bbr[[:space:]]*$/ {print}' "$MODULES_FILE"
     fi
@@ -1012,6 +1370,9 @@ write_persistent_config() {
 BBR_IFACE=$(printf '%q' "$iface")
 BBR_QDISC=$(printf '%q' "$TUNING_QDISC")
 BBR_QDISC_POLICY=$(printf '%q' "$QDISC_POLICY")
+BBR_CAKE_BANDWIDTH_MBPS=$(printf '%q' "$CAKE_BANDWIDTH_MBPS")
+BBR_QDISC_EXPLICIT=$([[ "$REQUESTED_QDISC" == auto || "$REQUESTED_QDISC" == keep ]] && echo 0 || echo 1)
+BBR_QDISC_STATE_DIR=$(printf '%q' "$STATE_DIR")
 EOF_ENV
   render_qdisc_helper | atomic_write "$QDISC_HELPER" 0755
   cat <<'EOF_SERVICE' | atomic_write "$SERVICE_FILE" 0644
@@ -1031,11 +1392,12 @@ EOF_SERVICE
   if systemd_available; then
     systemctl daemon-reload
     systemctl enable bbr-tcp-tuning.service >/dev/null
-    systemctl restart bbr-tcp-tuning.service
+    # The selected queue is already applied and verified by the caller. Do not
+    # restart under the same operation lock; the helper runs on the next boot.
   elif [[ "$QDISC_POLICY" == preserve ]]; then
-    info "TCP 开机配置已保存；现有 CAKE 队列的开机加载仍由原网络配置负责"
+    info "TCP 开机配置已保存；现有队列的开机加载仍由原网络配置负责"
   else
-    warn "当前未运行 systemd：sysctl 配置已保存，但 ${TUNING_QDISC} qdisc 需要自行设置开机任务"
+    warn "当前未运行 systemd：队列加载文件已保存，但 ${TUNING_QDISC} qdisc 需要自行设置开机任务"
   fi
 }
 
@@ -1065,6 +1427,11 @@ create_backup() {
   fi
   tc -s -d qdisc show dev "$iface" >"${backup}/qdisc.txt" || { error "无法备份出口队列"; return 1; }
   layout="$(qdisc_parse_layout <"${backup}/qdisc.txt")" || { error "队列备份不完整，尚未修改参数"; return 1; }
+  if [[ -n "$QDISC_ORIGINAL_JSON" ]]; then
+    tc -j -d qdisc show dev "$iface" >"${backup}/qdisc-original.json" || return 1
+    qdisc_json equal "$QDISC_ORIGINAL_JSON" "${backup}/qdisc-original.json" || { error "队列配置在预检后发生变化，未开始修改"; return 1; }
+    qdisc_json plan "${backup}/qdisc-original.json" >"${backup}/qdisc-original.tsv" || return 1
+  fi
   cat >"${backup}/meta.env" <<EOF_META
 IFACE=$(printf '%q' "$iface")
 ROOT_QDISC=$(printf '%q' "$(awk '$1=="root"{print $2}' <<<"$layout")")
@@ -1074,6 +1441,7 @@ QDISC_POLICY=$(printf '%q' "$QDISC_POLICY")
 EOF_META
   : >"${backup}/sysctl.tsv"
   for key in "${TUNING_SYSCTL_KEYS[@]}"; do
+    (( ! QDISC_ONLY )) || continue
     [[ "$QDISC_POLICY" != preserve || "$key" != net.core.default_qdisc ]] || continue
     if sysctl_exists "$key"; then
       value="$(sysctl_get "$key")"
@@ -1104,6 +1472,7 @@ restore_files() {
 }
 
 restore_qdisc() {
+  if [[ -s "${1}/qdisc-original.json" ]]; then restore_qdisc_exact "$1" "$2"; return; fi
   local backup="$1" iface="$2" recorded_kind="$3" saved current after root handle current_root current_handle parent leaf unused present
   [[ -r "${backup}/qdisc.txt" ]] || { qdisc_error '缺少原始队列备份，当前队列保持不动'; return 1; }
   saved="$(qdisc_parse_layout <"${backup}/qdisc.txt")" || { qdisc_error '队列备份无法解析，当前队列保持不动'; return 1; }
@@ -1114,7 +1483,7 @@ restore_qdisc() {
     [[ "$(qdisc_shape "$saved")" == "$(qdisc_shape "$current")" ]] || {
       qdisc_error '原队列布局已被其他操作改变；本次调优未修改队列，不执行覆盖恢复'; return 1;
     }
-    printf '[QDISC] %s｜本次调优未修改队列，保留现有 CAKE 配置\n' "$iface"
+    printf '[QDISC] %s｜本次调优未修改队列，保留原有队列配置\n' "$iface"
     return 0
   fi
   if [[ "$(qdisc_shape "$saved")" == "$(qdisc_shape "$current")" ]]; then
@@ -2273,7 +2642,7 @@ autotune() {
   if [[ "$QDISC_POLICY" == preserve ]]; then
     verify_preserved_qdisc "$iface" || die "原队列布局已变化；尚未开始测速或修改 TCP 参数"
   else
-    if ! qdisc_layout_safe "$iface" && (( ! FORCE )); then
+    if ! qdisc_layout_safe "$iface" && (( ! FORCE && ! QUEUE_SWITCH_READY )); then
       die "检测到自定义队列布局（root qdisc 为 '${root_kind}'）；为避免破坏现有 QoS，需审计后使用 --force"
     fi
     qdisc_preflight "$iface" "$TUNING_QDISC" || die "当前队列不适合安全自动调整；尚未开始测速或修改 TCP 参数"
@@ -2455,6 +2824,47 @@ autotune() {
   info "完整运行日志：$RUN_LOG"
   info "专业评估报告：$COMPARISON_FILE"
 }
+qdisc_command() {
+  require_linux; require_root; validate_qdisc_options
+  case "$REQUESTED_QDISC" in fq|fq_codel|cake) ;; *) die "单独切换队列需要 --qdisc fq、fq_codel 或 cake" ;; esac
+  for cmd in ip tc sysctl modprobe awk mktemp tee; do have "$cmd" || die "服务器缺少命令：$cmd"; done
+  init_session
+  install_python3_if_needed
+  local iface before
+  iface="$(resolve_iface)"
+  [[ -n "$iface" ]] && ip link show dev "$iface" >/dev/null 2>&1 || die "无法识别出口网卡"
+  select_tuning_qdisc "$iface" || die "队列切换预检失败，未修改服务器参数"
+  before="$(root_qdisc_kind "$iface")"
+  capture_state "$iface" "${SESSION_DIR}/system-before.txt"
+  section "出口队列切换"
+  printf '  网卡：%s\n  原根队列：%s\n  目标：%s\n' "$iface" "$before" "$(qdisc_policy_summary)"
+  printf '  本操作不修改 TCP 缓存、拥塞控制或系统默认队列。\n'
+  QDISC_ONLY=1
+  BACKUP_DIR="$(create_backup "$iface")"
+  TUNING_ACTIVE=1
+  trap cleanup_tuning_on_exit EXIT
+  trap stop_tuning_on_signal INT TERM HUP
+  pending_guard
+  schedule_rollback "$BACKUP_DIR"
+  apply_tuning_qdisc "$iface" || die "队列切换失败，正在恢复备份"
+  if (( PERSIST_FINAL )); then write_qdisc_persistence "$iface"; fi
+  capture_state "$iface" "${SESSION_DIR}/system-after.txt"
+  {
+    printf '出口队列调整报告\n'
+    printf '时间：%s\n网卡：%s\n原根队列：%s\n当前根队列：%s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$iface" "$before" "$(root_qdisc_kind "$iface")"
+    printf '队列策略：%s\n' "$(qdisc_policy_summary)"
+    printf 'TCP 缓存与拥塞控制：未修改\n开机加载：%s\n' "$([[ "$PERSIST_FINAL" == 1 ]] && echo 已配置 || echo 未修改)"
+    printf '原队列完整参数：%s/qdisc-original.json\n' "$BACKUP_DIR"
+    printf '原配置与切换后状态：%s\n' "$SESSION_DIR"
+    printf '安全回滚：%s 秒；验证业务后执行 bbr-tune confirm\n' "$AUTO_ROLLBACK_SECONDS"
+  } >"${SESSION_DIR}/queue-comparison.txt"
+  rm -f "$(pending_path "$BACKUP_DIR")/owner"
+  TUNING_ACTIVE=0
+  trap - EXIT INT TERM HUP
+  info "队列已切换；请在 ${AUTO_ROLLBACK_SECONDS} 秒内验证代理业务后执行 bbr-tune confirm"
+  info "操作报告：${SESSION_DIR}/queue-comparison.txt"
+}
+
 status_command() {
   require_linux
   for cmd in ip tc sysctl awk; do have "$cmd" || die "缺少命令：$cmd"; done
@@ -2533,6 +2943,7 @@ ui_menu_options() {
   printf '\n  参数管理\n'
   printf '    4  确认保留当前参数\n'
   printf '    5  恢复调优前参数\n'
+  printf '    8  更改出口队列算法\n'
   printf '\n  工具\n'
   printf '    6  使用说明\n'
   printf '    7  BBRv3 内核管理\n'
@@ -2604,8 +3015,66 @@ ui_select_strategy() {
   done
 }
 
+ui_select_qdisc() {
+  local mode="${1:-tune}" choice
+  printf '\n出口队列算法\n' >&2
+  if [[ "$mode" == tune ]]; then
+    printf '  1) 自动：普通队列使用 fq，已有 CAKE 保留（默认）\n' >&2
+    printf '  2) 保留：不修改任何现有队列\n' >&2
+    printf '  3) fq：按连接公平调度\n  4) fq_codel：公平调度与主动队列管理\n' >&2
+    printf '  5) CAKE：公平调度与可选出站带宽整形\n' >&2
+  else
+    printf '  1) fq：按连接公平调度\n  2) fq_codel：公平调度与主动队列管理\n' >&2
+    printf '  3) CAKE：公平调度与可选出站带宽整形\n  0) 返回\n' >&2
+  fi
+  printf '  切换不代表一定提速；原配置不能安全恢复时会停止。\n' >&2
+  printf '  从 CAKE 改为其他算法会取消原 CAKE 的带宽整形。\n' >&2
+  while true; do
+    read -r -p "请选择队列$([[ "$mode" == tune ]] && printf ' [1]')：" choice || return 1
+    if [[ "$mode" == tune ]]; then
+      case "${choice:-1}" in
+        1) echo auto; return ;; 2) echo keep; return ;;
+        3) echo fq; return ;; 4) echo fq_codel; return ;; 5) echo cake; return ;;
+      esac
+    else
+      case "$choice" in
+        0) return 1 ;; 1) echo fq; return ;; 2) echo fq_codel; return ;; 3) echo cake; return ;;
+      esac
+    fi
+    printf '请选择列表中的编号\n' >&2
+  done
+}
+
+ui_read_cake_bandwidth() {
+  local value
+  printf '\nCAKE 整形带宽是服务器出站限速，不等于下载测速目标。\n' >&2
+  printf '留空：保留已有 CAKE 带宽，新建时不限速；0：明确取消 CAKE 限速。\n' >&2
+  printf '仅单根队列可设置带宽；mq 子队列不设置整张网卡的总带宽。\n' >&2
+  while true; do
+    read -r -p 'CAKE 整形带宽 Mbps [留空]：' value || return 1
+    if [[ -z "$value" ]] || { is_number "$value" && awk -v n="$value" 'BEGIN{exit !(n==0 || (n>=0.001 && n<=100000))}'; }; then
+      printf '%s\n' "$value"; return
+    fi
+    printf '请输入 0 或 0.001～100000 的数字，或直接回车\n' >&2
+  done
+}
+
+ui_qdisc() {
+  local selected rate="" iface
+  local args=()
+  selected="$(ui_select_qdisc switch)" || return
+  if [[ "$selected" == cake ]]; then rate="$(ui_read_cake_bandwidth)" || return; fi
+  iface="$(ui_read_text '出口网卡（auto 为自动识别）' "$IFACE")" || return
+  [[ -z "$rate" ]] || args+=(--cake-bandwidth-mbps "$rate")
+  if ui_yes_no '将所选队列写入开机配置' n; then args+=(--persist); fi
+  printf '\n  目标队列：%s\n  安全回滚：%s 秒\n' "$selected" "$AUTO_ROLLBACK_SECONDS"
+  printf '  本操作可能短暂影响代理连接；建议保留备用 SSH 或云控制台。\n'
+  ui_yes_no '备份并切换队列' n || return
+  ui_execute 1 qdisc --iface "$iface" --qdisc "$selected" ${args[@]+"${args[@]}"}
+}
+
 ui_autotune() {
-  local address bandwidth streams duration util retrans strategy
+  local address bandwidth streams duration util retrans strategy selected_qdisc cake_rate=""
   local args=()
   address="$(guess_server_address 2>/dev/null || true)"
   printf '%s目标带宽说明%s\n' "$UI_YELLOW" "$UI_RESET"
@@ -2613,6 +3082,10 @@ ui_autotune() {
   printf '  建议填写：服务器出站带宽上限与本地下载带宽上限中的较小值。\n'
   printf '  例如服务器限速 200 Mbps、本地宽带 1000 Mbps，应填写 200。\n\n'
   strategy="$(ui_select_strategy)" || return
+  selected_qdisc="$(ui_select_qdisc)" || return
+  if [[ "$selected_qdisc" == cake ]]; then cake_rate="$(ui_read_cake_bandwidth)" || return; fi
+  args+=(--qdisc "$selected_qdisc")
+  [[ -z "$cake_rate" ]] || args+=(--cake-bandwidth-mbps "$cake_rate")
   bandwidth="$(ui_read_number "期望端到端下载带宽 Mbps" "1000" "1" "100000")" || return
   address="$(ui_read_text "服务器公网 IP 或域名" "$address")" || return
   [[ -n "$address" ]] || { printf '%s服务器地址不能为空%s\n' "$UI_RED" "$UI_RESET"; return; }
@@ -2624,6 +3097,7 @@ ui_autotune() {
   local selected_name
   case "$strategy" in balanced) selected_name="均衡" ;; speed) selected_name="速度优先" ;; stable) selected_name="稳定优先" ;; retrans) selected_name="低重传优先" ;; esac
   section "开始前确认"
+  printf '  • 队列选择：%s；需切换时先验证内核支持和原配置恢复。\n' "$selected_qdisc"
   printf '  • RTT 由首轮 iperf3 自动测量。\n'
   printf '  • 每组参数依次执行单连接和 %s 连接测试，以所选方案评分选优。\n' "$streams"
   printf '  • 方案：%s；每种连接数默认复测 2 次，按中位数评价。\n' "$selected_name"
@@ -2635,7 +3109,7 @@ ui_autotune() {
   ui_yes_no "开始自动寻优" "n" || return
   ui_execute 1 autotune --strategy "$strategy" --bandwidth-mbps "$bandwidth" --server-address "$address" \
     --parallel "$streams" --duration "$duration" \
-    --target-utilization "$util" --max-retrans-percent "$retrans" "${args[@]}"
+    --target-utilization "$util" --max-retrans-percent "$retrans" ${args[@]+"${args[@]}"}
 }
 kernel_command() {
   local canonical helper
@@ -2664,6 +3138,7 @@ menu() {
       5) ui_execute 1 rollback || true ;;
       6) usage ;;
       7) ui_execute 1 kernel menu || true ;;
+      8) ui_qdisc || true ;;
       0) return ;;
       *) printf '%s无效选择%s\n' "$UI_RED" "$UI_RESET" ;;
     esac
@@ -2678,10 +3153,11 @@ main() {
     require_linux; require_root
     stop_expired_session
   fi
-  case "$COMMAND" in autotune|confirm|rollback) acquire_operation_lock ;; esac
+  case "$COMMAND" in autotune|qdisc|confirm|rollback) acquire_operation_lock ;; esac
   case "$COMMAND" in
     menu) menu ;;
     autotune) autotune ;;
+    qdisc) qdisc_command ;;
     kernel) kernel_command ;;
     status) status_command ;;
     history) history_command ;;

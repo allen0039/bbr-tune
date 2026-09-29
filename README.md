@@ -1,6 +1,6 @@
 # bbr-tune 使用指南
 
-**版本 2.8.2** · 在远程 Linux 服务器上运行的 TCP / BBR 调优工具。
+**版本 2.9.0** · 在远程 Linux 服务器上运行的 TCP / BBR 调优工具。
 
 服务器执行调优，本地电脑仅运行测速命令。工具不会修改本地电脑的 TCP 参数，不会自动重启服务器，也不会自动开放防火墙端口。
 
@@ -49,6 +49,7 @@ BBR TUNE / 远程服务器网络调优
   参数管理
     4  确认保留当前参数
     5  恢复调优前参数
+    8  更改出口队列算法
 
   工具
     6  使用说明
@@ -56,7 +57,7 @@ BBR TUNE / 远程服务器网络调优
     0  退出
 ```
 
-选择 `1` 开始调优。建议保持默认测试时长、并发流数和复测设置。
+选择 `1` 开始调优，可同时选择出口队列算法。只需切换队列、不运行测速时，选择 `8`。建议保持默认测试时长、并发流数和复测设置。
 
 ### 填写目标带宽
 
@@ -174,6 +175,8 @@ bbr-tune help
 | `--bandwidth-mbps N` | 端到端下载目标，范围大于 0 至 100000 Mbps | 必填 |
 | `--server-address HOST` | 本地测速连接地址 | 尝试自动识别 |
 | `--strategy NAME` | `balanced`、`speed`、`stable`、`retrans` | `balanced` |
+| `--qdisc ALGO` | `auto`、`keep`、`fq`、`fq_codel` 或 `cake` | `auto` |
+| `--cake-bandwidth-mbps N` | CAKE 出站整形带宽，0.001～100000 Mbps；`0` 明确取消限速；留空保留已有值，新建时不限速 | 留空 |
 | `--iface DEV` | 服务器出口网卡 | 自动识别 |
 | `--parallel N` | 多连接测试并发流数 | `8` |
 | `--duration N` | 每轮传输时长，5～300 秒 | `15` |
@@ -181,7 +184,7 @@ bbr-tune help
 | `--target-utilization N` | 目标带宽利用率，百分比 | `90` |
 | `--max-retrans-percent N` | 允许的最大估算重传率，百分比 | `1` |
 | `--persist` | 保存最终参数至开机配置 | 不保存 |
-| `--force` | 允许替换其他非默认队列；含 CAKE 的布局仍会保留。仅在已有独立备份时使用 | 关闭 |
+| `--force` | 旧自动模式的自定义队列覆盖选项，不会绕过显式切换的恢复预检。不建议常规使用 | 关闭 |
 
 关闭终端颜色：
 
@@ -189,7 +192,64 @@ bbr-tune help
 sudo env NO_COLOR=1 bbr-tune
 ```
 
-## 6. 日志与跨时段对比
+## 6. 队列算法与 CAKE
+
+| 选择 | 使用方式 |
+| --- | --- |
+| `auto` | 普通队列使用 `fq`；已有 CAKE 时保留整个布局，仅调优 TCP |
+| `keep` | 保留当前队列算法及参数，只调优 TCP |
+| `fq` | 明确选择按连接公平调度的队列 |
+| `fq_codel` | 明确选择公平调度与主动队列管理 |
+| `cake` | 明确选择 CAKE，可另外设置服务器出站整形带宽 |
+
+选择算法不代表一定提速。请比较同一时段、同一本地网络下的单连接和多连接实测结果。
+
+### 单独切换队列
+
+在菜单中选择 `8`，或执行：
+
+```bash
+# 切换为 fq，只对当前运行生效
+sudo bbr-tune qdisc --qdisc fq
+
+# 切换为 fq_codel，并设置该出口网卡的开机加载
+sudo bbr-tune qdisc --qdisc fq_codel --persist
+
+# 使用 CAKE；已有 CAKE 时保持其带宽，新建时不限速
+sudo bbr-tune qdisc --qdisc cake
+
+# 明确设置 CAKE 的服务器出站整形带宽为 190 Mbps
+sudo bbr-tune qdisc --qdisc cake --cake-bandwidth-mbps 190 --persist
+
+# 明确取消 CAKE 的整形限速，其他已有 CAKE 选项不变
+sudo bbr-tune qdisc --qdisc cake --cake-bandwidth-mbps 0
+```
+
+可添加 `--iface eth0` 指定出口网卡。单独切换不修改 TCP 缓存、TCP 拥塞控制或系统默认队列。
+
+操作完成后，先通过备用 SSH 会话验证代理业务，再执行 `sudo bbr-tune confirm`。未在默认 `3600` 秒内确认时会尝试恢复备份；手动恢复使用 `sudo bbr-tune rollback`。本次报告位于会话目录下的 `queue-comparison.txt`。
+
+### 在 TCP 调优时选择队列
+
+```bash
+sudo bbr-tune autotune \
+  --bandwidth-mbps 200 \
+  --qdisc cake \
+  --cake-bandwidth-mbps 190 \
+  --persist
+```
+
+`--bandwidth-mbps` 是服务器到本地的下载测速目标，**`--cake-bandwidth-mbps` 是服务器出站整形上限**，两者不会相互代填。整形可能影响该出口上的其他流量。切换至 CAKE 以外的算法会移除原 CAKE 的整形限制，请确认这符合你的需求。
+
+### 使用条件与限制
+
+- 实际切换前，需要服务器支持临时网络命名空间、dummy 网卡和目标队列模块。不能完成内核支持及原配置恢复检查时，操作会停止；受限容器可选择 `keep` 继续 TCP 调优。
+- 单根 `fq`、`fq_codel`、`cake`、`noqueue` 和可定位的 `mq` 子队列可参与切换检查。未知选项、复杂分层队列或已有出口过滤规则可能阻止自动切换；请保留现有配置或由管理员处理。
+- 对 `mq` 网卡，仅切换可定位的子队列，不删除根队列。`mq 0:` 下需要变更的子队列仍会停止操作。
+- CAKE 的网卡总整形带宽只支持单根队列，不能把同一个总带宽重复设置到多个 `mq` 子队列。
+- `--persist` 保存所选队列的开机加载。若另有网络服务管理队列，请先协调其配置；本工具不会自动停用其他服务，开机会重新备份并检查当前队列，无法安全切换时停止，而不是强制替换。
+
+## 7. 日志与跨时段对比
 
 ```bash
 sudo bbr-tune history
@@ -204,7 +264,10 @@ sudo bbr-tune history
   history.tsv                   历史汇总
   sessions/<会话编号>/            每次测试的独立记录
     run.log                     运行日志
-    comparison.txt              完整前后对比报告
+    comparison.txt              TCP 调优前后对比报告
+    queue-comparison.txt        单独切换队列的操作报告
+    qdisc-original.json         切换前队列参数
+    qdisc-probe.log             队列支持及恢复检查记录
     results.tsv                 逐轮测试结果
     *.measurements.tsv          各轮重复测量明细
     sysctl-comparison.tsv       参数前后对比
@@ -225,7 +288,7 @@ sudo tail -f /var/lib/bbr-tcp-tuning/sessions/会话编号/run.log
 
 对比早高峰、晚高峰或不同日期时，请使用同一本地电脑、网络、目标带宽、调优方案和测试设置。日志可能包含 IP 地址和系统信息，分享前请检查并脱敏。
 
-## 7. BBRv3 内核管理（可选）
+## 8. BBRv3 内核管理（可选）
 
 TCP 调优不要求先更换内核。只有确有需要且具备云控制台或救援访问时，才使用菜单 `7`。
 
@@ -264,7 +327,7 @@ sudo bbr-tune kernel fallback
 
 `fallback` 只安排下次启动，不立即切换内核。`confirm` / `rollback` 管理 TCP 参数；`accept` / `fallback` 管理内核，两者不可混用。
 
-## 8. 常见问题
+## 9. 常见问题
 
 ### 本地显示 Connection refused
 
@@ -286,11 +349,11 @@ sudo bbr-tune kernel fallback
 
 ### 提示自定义队列为 cake，无法开始调优
 
-更新到 2.8.2 或更新版本后直接重新运行 `sudo bbr-tune`，不需要添加 `--force`。
+更新后重新运行 `sudo bbr-tune`。默认 `auto` 会保留 CAKE 并继续 TCP 调优；如需更换算法，可通过菜单 `8` 或 `--qdisc` 明确选择，不需要使用 `--force` 绕过检查。
 
 检测到现有 CAKE 队列时，工具会保留整个队列布局及其带宽、流量分类等设置，继续测试并选择 TCP/BBR 参数。报告会显示实际队列，不会把该次测试标记为 `fq`。若 CAKE 配置了整形带宽，测试仍受该带宽约束；增加 TCP 缓存不会取消该限制。
 
-选择写入开机配置时，仅保存 TCP 调优结果；已有的队列默认配置保持原样，CAKE 的开机加载仍由原网络配置或服务负责。本工具不会重建 CAKE 或将其替换成 `fq`。
+使用默认保留策略时，已有队列配置保持原样，CAKE 的开机加载仍由原网络配置或服务负责。明确选择另一算法时，工具会先检查原参数能否恢复，再执行切换。
 
 ### 出现 Failed to find specified qdisc 或队列恢复失败
 
@@ -303,7 +366,7 @@ sudo bbr-tune status
 ```
 
 - 若显示 `mq 0:`，且所有子队列都为 `fq`，可以保留原有多队列配置继续调优，无需手工删除或替换队列。
-- 若布局中含有 CAKE，工具会保留整个布局继续 TCP 调优。若 `mq 0:` 下没有 CAKE、但仍有非 `fq` 子队列，工具会停止，不会修改本次 TCP 参数。请先由服务器管理员检查和配置多队列；不要使用 `--force` 尝试绕过。
+- 默认 `auto` 遇到 CAKE 时会保留整个布局继续 TCP 调优；显式指定 `--qdisc` 时按所选算法执行切换检查。若 `mq 0:` 下没有 CAKE、但仍有非 `fq` 子队列，工具会停止，不会修改本次 TCP 参数。请先由服务器管理员检查和配置多队列；不要使用 `--force` 尝试绕过。
 - 若回滚提示根句柄或子队列布局已变化，请保留备份，通过云控制台核对 `qdisc.txt` 与当前队列。**不要直接执行 `tc qdisc del ... root`，也不要用 `confirm` 代替恢复。**
 
 回滚会还原原开机配置和服务启用状态，但不会立即重新执行备份中的旧版队列脚本。恢复后先检查代理业务；如需重新保存调优配置，请使用更新后的工具完成调优并选择写入开机配置。
