@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.6.1"
+VERSION="2.7.0"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -2318,7 +2318,7 @@ menu() {
     printf '  4) 确认保留当前参数\n'
     printf '  5) 恢复调优前参数\n'
     printf '  6) 使用说明\n'
-    printf '  7) BBRv3 内核管理（独立安装/编译，不自动重启）\n'
+    printf '  7) BBRv3 内核管理（第三方标准版 Release，不自动重启）\n'
     printf '  0) 退出\n\n'
     read -r -p "请选择：" choice || return
     case "$choice" in
