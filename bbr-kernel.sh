@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remote Linux kernel lifecycle; kept separate from TCP measurement and rollback.
 set -Eeuo pipefail
-KERNEL_HELPER_VERSION="2.7.0"
+KERNEL_HELPER_VERSION="2.7.1"
 K_ROOT="/var/lib/bbr-tcp-tuning/kernels"
 K_LATEST="${K_ROOT}/latest"
 K_YES=0
@@ -393,24 +393,78 @@ k_download_asset() {
   k_verify_sha256 "${output}.part" "$digest" || k_die "${name} 的 SHA-256 与 GitHub Release API 不一致"
   mv -f "${output}.part" "$output"
 }
-k_download_packages() {
-  local image_pkg headers_pkg image_ver headers_ver
-  k_download_asset "$K_IMAGE_NAME" "$K_IMAGE_URL" "$K_IMAGE_DIGEST" "$K_IMAGE_SIZE" "${K_SESSION}/packages/${K_IMAGE_NAME}"
-  k_download_asset "$K_HEADERS_NAME" "$K_HEADERS_URL" "$K_HEADERS_DIGEST" "$K_HEADERS_SIZE" "${K_SESSION}/packages/${K_HEADERS_NAME}"
-  k_download_asset "$K_CONFIG_NAME" "$K_CONFIG_URL" "$K_CONFIG_DIGEST" "$K_CONFIG_SIZE" "${K_SESSION}/release.config"
+k_write_release_assets() {
   printf 'type\tname\tsize\tdigest\turl\nimage\t%s\t%s\t%s\t%s\nheaders\t%s\t%s\t%s\t%s\nconfig\t%s\t%s\t%s\t%s\n' \
     "$K_IMAGE_NAME" "$K_IMAGE_SIZE" "$K_IMAGE_DIGEST" "$K_IMAGE_URL" \
     "$K_HEADERS_NAME" "$K_HEADERS_SIZE" "$K_HEADERS_DIGEST" "$K_HEADERS_URL" \
     "$K_CONFIG_NAME" "$K_CONFIG_SIZE" "$K_CONFIG_DIGEST" "$K_CONFIG_URL" >"${K_SESSION}/release-assets.tsv"
+}
+k_download_release_config() {
+  k_write_release_assets
+  k_download_asset "$K_CONFIG_NAME" "$K_CONFIG_URL" "$K_CONFIG_DIGEST" "$K_CONFIG_SIZE" "${K_SESSION}/release.config"
+  for required in CONFIG_TCP_CONG_BBR=y CONFIG_NET_SCH_FQ=y; do
+    grep -Fxq "$required" "${K_SESSION}/release.config" || k_die "发布配置缺少 ${required}"
+  done
+}
+k_package_status() {
+  dpkg-query -W -f='${db:Status}\t${Version}\n' "$1" 2>/dev/null || true
+}
+k_existing_target_state() {
+  local image_package="linux-image-${K_TARGET}" headers_package="linux-headers-${K_TARGET}"
+  local image_status headers_status image_version="" headers_version="" module_version="" state=conflict
+  local image_state headers_state
+  image_status="$(k_package_status "$image_package")"
+  headers_status="$(k_package_status "$headers_package")"
+  [[ "$image_status" == $'install ok installed\t'* ]] && image_version="${image_status#*$'\t'}"
+  [[ "$headers_status" == $'install ok installed\t'* ]] && headers_version="${headers_status#*$'\t'}"
+  [[ ! -d "${K_MODULES_DIR}/${K_TARGET}" ]] || module_version="$(modinfo -k "$K_TARGET" -F version tcp_bbr 2>/dev/null || true)"
+
+  if [[ "$K_TARGET" == "$K_OLD" ]]; then
+    state=running
+  elif [[ "$image_version" == "$K_META_VERSION" && "$headers_version" == "$K_META_VERSION" \
+      && -s "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" && -s "${K_BOOT_DIR}/initrd.img-${K_TARGET}" \
+      && -d "${K_MODULES_DIR}/${K_TARGET}" && -r "${K_BOOT_DIR}/config-${K_TARGET}" \
+      && "$module_version" == 3 ]] \
+      && cmp -s "${K_SESSION}/release.config" "${K_BOOT_DIR}/config-${K_TARGET}"; then
+    state=complete
+  elif [[ -z "$image_status" && -z "$headers_status" \
+      && ! -e "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" && ! -e "${K_BOOT_DIR}/initrd.img-${K_TARGET}" \
+      && ! -e "${K_BOOT_DIR}/config-${K_TARGET}" && ! -e "${K_MODULES_DIR}/${K_TARGET}" ]]; then
+    state=absent
+  fi
+
+  image_state="${image_status%%$'\t'*}"; headers_state="${headers_status%%$'\t'*}"
+  [[ -n "$image_state" ]] || image_state='<未安装>'
+  [[ -n "$headers_state" ]] || headers_state='<未安装>'
+  {
+    printf 'field\tvalue\nstate\t%s\n' "$state"
+    printf 'running_kernel\t%s\ntarget_kernel\t%s\n' "$K_OLD" "$K_TARGET"
+    printf 'image_package_status\t%s\nimage_package_version\t%s\n' \
+      "$image_state" "${image_version:-<未安装>}"
+    printf 'headers_package_status\t%s\nheaders_package_version\t%s\n' \
+      "$headers_state" "${headers_version:-<未安装>}"
+    printf 'expected_package_version\t%s\nmodule_version\t%s\n' "$K_META_VERSION" "${module_version:-<未取得>}"
+    printf 'vmlinuz\t%s\ninitramfs\t%s\nmodules\t%s\nconfig\t%s\n' \
+      "$([[ -s "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" ]] && echo present || echo missing)" \
+      "$([[ -s "${K_BOOT_DIR}/initrd.img-${K_TARGET}" ]] && echo present || echo missing)" \
+      "$([[ -d "${K_MODULES_DIR}/${K_TARGET}" ]] && echo present || echo missing)" \
+      "$([[ -r "${K_BOOT_DIR}/config-${K_TARGET}" ]] && echo present || echo missing)"
+    if [[ -r "${K_BOOT_DIR}/config-${K_TARGET}" ]]; then
+      if cmp -s "${K_SESSION}/release.config" "${K_BOOT_DIR}/config-${K_TARGET}"; then printf 'config_match\tyes\n'; else printf 'config_match\tno\n'; fi
+    else printf 'config_match\tunknown\n'; fi
+  } >"${K_SESSION}/existing-target.tsv"
+  printf '%s\n' "$state"
+}
+k_download_packages() {
+  local image_pkg headers_pkg image_ver headers_ver
+  k_download_asset "$K_IMAGE_NAME" "$K_IMAGE_URL" "$K_IMAGE_DIGEST" "$K_IMAGE_SIZE" "${K_SESSION}/packages/${K_IMAGE_NAME}"
+  k_download_asset "$K_HEADERS_NAME" "$K_HEADERS_URL" "$K_HEADERS_DIGEST" "$K_HEADERS_SIZE" "${K_SESSION}/packages/${K_HEADERS_NAME}"
   image_pkg="$(dpkg-deb -f "${K_SESSION}/packages/${K_IMAGE_NAME}" Package)"
   headers_pkg="$(dpkg-deb -f "${K_SESSION}/packages/${K_HEADERS_NAME}" Package)"
   image_ver="$(dpkg-deb -f "${K_SESSION}/packages/${K_IMAGE_NAME}" Version)"
   headers_ver="$(dpkg-deb -f "${K_SESSION}/packages/${K_HEADERS_NAME}" Version)"
   [[ "$image_pkg" == "linux-image-${K_TARGET}" && "$headers_pkg" == "linux-headers-${K_TARGET}" ]] || k_die 'deb 包名与 Release 标签不匹配'
   [[ "$image_ver" == "$K_META_VERSION" && "$headers_ver" == "$K_META_VERSION" ]] || k_die 'image 与 headers 软件包版本不一致'
-  for required in CONFIG_TCP_CONG_BBR=y CONFIG_NET_SCH_FQ=y; do
-    grep -Fxq "$required" "${K_SESSION}/release.config" || k_die "发布配置缺少 ${required}"
-  done
 }
 k_guard_old_boot() {
   [[ ! -f /var/lib/bbr-tcp-tuning/pending-latest/armed ]] || k_die '下载期间出现待确认 TCP 调优，先处理后再安装内核'
@@ -437,10 +491,37 @@ k_guard_old_boot() {
   ln -sfn "$K_SESSION" "$K_LATEST"
   k_log "旧内核保持默认：${K_OLD}；不会删除或自动重启"
 }
+k_validate_installed_target() {
+  [[ -s "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" && -s "${K_BOOT_DIR}/initrd.img-${K_TARGET}" && -d "${K_MODULES_DIR}/${K_TARGET}" ]] || k_die '目标内核、initramfs 或 modules 不完整，不安排启动'
+  cmp -s "${K_SESSION}/release.config" "${K_BOOT_DIR}/config-${K_TARGET}" || k_die '已安装内核配置与已校验的 Release 配置不一致'
+  grep -Eq '^CONFIG_TCP_CONG_BBR=[ym]$' "${K_BOOT_DIR}/config-${K_TARGET}" || k_die '已安装内核不包含 BBR'
+  local version
+  version="$(modinfo -k "$K_TARGET" -F version tcp_bbr 2>/dev/null || true)"
+  [[ "$version" == 3 ]] || k_die '已安装内核不能通过模块元数据确认为 BBRv3；保留旧默认项，不安排试用'
+}
+k_finalize_installed_target() {
+  k_validate_installed_target
+  update-grub
+  K_TARGET_ENTRY="$(k_grub_entry "$K_TARGET")" || k_die '新内核缺少可识别启动项'
+  [[ "$(k_grub_entry "$K_OLD")" == "$K_OLD_ENTRY" ]] || k_die '旧内核启动项发生变化，停止'
+  grub-editenv "$K_GRUB_ENV" list | grep -Fxq "saved_entry=${K_OLD_ENTRY}" || k_die '默认启动项不再是旧内核，请检查 GRUB'
+  K_STATUS=installed; k_save_state
+  k_log "目标内核已纳入安全试用流程：${K_TARGET}；当前仍运行 ${K_OLD}"
+  k_log '下一步：sudo bbr-tune kernel trial；阅读恢复说明后自行安排重启'
+  k_log '重启后：sudo bbr-tune kernel verify；验证业务后 sudo bbr-tune kernel accept'
+  k_log '未添加软件源、未运行上游脚本；后续安全更新需重新执行 install 并经过试启动/验证'
+}
+k_adopt_existing_target() {
+  k_log "检测到完全匹配的目标内核已安装：${K_TARGET}；不会覆盖或重复安装"
+  k_guard_old_boot
+  k_finalize_installed_target
+}
 k_install_artifacts() {
-  local deb name arch images=0 headers=0
+  local deb name arch images=0 headers=0 preinstall_state
   local debs=()
-  [[ "$K_TARGET" != "$K_OLD" && ! -e "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" ]] || k_die '目标内核已经存在；不会覆盖当前或现有内核'
+  [[ "$K_TARGET" != "$K_OLD" ]] || k_die '目标内核正是当前运行内核，不能从当前状态建立旧内核回退基线'
+  preinstall_state="$(k_existing_target_state)"
+  [[ "$preinstall_state" == absent ]] || k_die "安装前目标状态已变为 ${preinstall_state}；拒绝覆盖或重复安装。详情：${K_SESSION}/existing-target.tsv"
   for deb in "${K_SESSION}/packages/"*.deb; do
     [[ -f "$deb" ]] || continue
     name="$(dpkg-deb -f "$deb" Package)"; arch="$(dpkg-deb -f "$deb" Architecture)"
@@ -456,23 +537,10 @@ k_install_artifacts() {
   sha256sum "${debs[@]}" >"${K_SESSION}/packages.sha256"
   k_guard_old_boot
   DEBIAN_FRONTEND=noninteractive apt-get install --no-remove -y "${debs[@]}"
-  [[ -s "${K_BOOT_DIR}/vmlinuz-${K_TARGET}" && -s "${K_BOOT_DIR}/initrd.img-${K_TARGET}" && -d "${K_MODULES_DIR}/${K_TARGET}" ]] || k_die '目标内核、initramfs 或 modules 不完整，不安排启动'
-  cmp -s "${K_SESSION}/release.config" "${K_BOOT_DIR}/config-${K_TARGET}" || k_die '已安装内核配置与已校验的 Release 配置不一致'
-  grep -Eq '^CONFIG_TCP_CONG_BBR=[ym]$' "${K_BOOT_DIR}/config-${K_TARGET}" || k_die '已安装内核不包含 BBR'
-  local version
-  version="$(modinfo -k "$K_TARGET" -F version tcp_bbr 2>/dev/null || true)"
-  [[ "$version" == 3 ]] || k_die '已安装内核不能通过模块元数据确认为 BBRv3；保留旧默认项，不安排试用'
-  update-grub
-  K_TARGET_ENTRY="$(k_grub_entry "$K_TARGET")" || k_die '新内核缺少可识别启动项'
-  [[ "$(k_grub_entry "$K_OLD")" == "$K_OLD_ENTRY" ]] || k_die '旧内核启动项发生变化，停止'
-  grub-editenv "$K_GRUB_ENV" list | grep -Fxq "saved_entry=${K_OLD_ENTRY}" || k_die '默认启动项不再是旧内核，请检查 GRUB'
-  K_STATUS=installed; k_save_state
-  k_log "已安装 ${K_TARGET}；当前仍运行 ${K_OLD}，不能宣称 BBRv3 已生效"
-  k_log '下一步：sudo bbr-tune kernel trial；阅读恢复说明后自行安排重启'
-  k_log '重启后：sudo bbr-tune kernel verify；验证业务后 sudo bbr-tune kernel accept'
-  k_log '未添加软件源、未运行上游脚本；后续安全更新需重新执行 install 并经过试启动/验证'
+  k_finalize_installed_target
 }
 k_install() {
+  local target_state
   k_linux; k_root; k_detect_os
   k_require_environment
   k_confirm_install
@@ -481,8 +549,20 @@ k_install() {
   [[ "$(k_secure_boot)" == disabled ]] || k_die 'Secure Boot 已启用或未知，停止自动安装'
   k_grub_entry "$K_OLD" >/dev/null || k_die '原内核启动项不明确，拒绝开始内核下载'
   k_prepare_release
-  k_download_packages
-  k_install_artifacts
+  k_download_release_config
+  target_state="$(k_existing_target_state)"
+  case "$target_state" in
+    absent)
+      k_download_packages
+      k_install_artifacts ;;
+    complete)
+      k_adopt_existing_target ;;
+    running)
+      k_die "目标 ${K_TARGET} 已是当前运行内核；无需重复安装。若它不是由本工具试用，不能从当前状态自动建立旧内核回退基线" ;;
+    conflict)
+      k_die "检测到同名目标内核残缺、版本不符或配置不一致；拒绝覆盖。详情：${K_SESSION}/existing-target.tsv" ;;
+    *) k_die "无法识别目标内核状态：${target_state}" ;;
+  esac
   trap - EXIT
 }
 k_read_field() {

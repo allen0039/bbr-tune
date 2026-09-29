@@ -1,6 +1,6 @@
 # bbr-tune：按实测规则选择 TCP / BBR 参数
 
-版本 **2.7.0**。在远程 Linux 代理服务器运行；本地电脑只执行屏幕给出的 `iperf3` 命令，不修改本地网络参数。
+版本 **2.7.1**。在远程 Linux 代理服务器运行；本地电脑只执行屏幕给出的 `iperf3` 命令，不修改本地网络参数。
 
 本版本提供 **均衡、速度优先、稳定优先、低重传优先** 四种方案。它们是不同的**实测选优策略**，不是四份固定 sysctl 清单，也不改变 BBR 算法内部增益。每种方案都测试单连接和多连接。
 
@@ -59,6 +59,12 @@ x86_64-X.Y.Z.config
 5. 发布配置必须启用 `CONFIG_TCP_CONG_BBR=y` 和 `CONFIG_NET_SCH_FQ=y`；
 6. Release 不能落后于 kernel.org 同系列当前稳定/LTS 修订，也不能属于 RC、EOL 或未列出系列；
 7. 安装后再次检查 `/boot/config-*`、内核文件、initramfs、modules 和 `tcp_bbr` 模块版本。
+
+工具会先下载体积较小的 Release 配置文件，再检查目标内核是否已经存在：
+
+- image、headers、`vmlinuz`、initramfs、modules、发布配置和 `tcp_bbr` v3 元数据全部匹配时，不覆盖、不重复安装，也不再次下载大型 deb；工具会将该内核安全纳入 `trial` / `verify` / `accept` / `fallback` 流程。
+- 同名内核残缺、软件包版本不符、配置不一致或无法确认 BBRv3 时，拒绝覆盖并在会话目录生成 `existing-target.tsv` 诊断表。
+- 如果 Release 目标就是当前运行内核，工具不会伪造“旧内核”回退基线；应先确认现有启动与恢复策略，再决定是否管理该内核。
 
 GitHub 提供的 SHA-256 可以证明下载内容与当时的 Release 元数据一致，**不等同于 Debian/Ubuntu 发行版签名，也不能证明第三方构建不存在恶意或缺陷**。Release 标签解析出的 Git 提交、所选 Release JSON、资产 URL、API 摘要和本地 SHA-256 都会保留在会话日志中。
 
@@ -131,7 +137,7 @@ sudo bbr-tune kernel install --yes --console-available
 /var/lib/bbr-tcp-tuning/kernels/<时间戳-PID>/
 ```
 
-其中包括 `run.log`、`state.json`、`releases.json`、`selected-release.json`、`tag-ref.json`、`release-assets.tsv`、`release.config`、`packages.sha256`、GRUB 修改前快照及下载的 image/headers 包。不会自动删除旧内核，也不会自动执行服务器重启。
+其中包括 `run.log`、`state.json`、`releases.json`、`selected-release.json`、`tag-ref.json`、`release-assets.tsv`、`release.config`、`existing-target.tsv` 和 GRUB 修改前快照。仅在需要首次安装时才会另外保留 `packages.sha256` 与下载的 image/headers 包。不会自动删除旧内核，也不会自动执行服务器重启。
 
 ## 如何选择方案
 
