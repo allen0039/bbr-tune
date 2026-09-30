@@ -2,7 +2,7 @@
 # bbr-tune.sh - 远程 Linux 服务器 TCP/BBR 自动测试与参数寻优工具
 set -Eeuo pipefail
 
-VERSION="2.9.0"
+VERSION="2.10.4"
 PROGRAM="${0##*/}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
@@ -63,6 +63,8 @@ PERSIST_FINAL="0"
 FORCE="0"
 YES="0"
 BACKUP_PATH=""
+HISTORY_SESSION=""
+HISTORY_PARAMS_AFTER="0"
 QUIET="0"
 UI_BLUE=""; UI_GREEN=""; UI_YELLOW=""; UI_RED=""; UI_RESET=""
 
@@ -287,14 +289,20 @@ usage() {
 远程服务器 TCP/BBR 自动寻优工具
 
 用法：
+  bbrtcp                                    打开交互界面（安装后）
   sudo ./bbr-tune.sh                         交互界面
   sudo ./bbr-tune.sh autotune [参数]         自动测试并选择最优参数
   sudo ./bbr-tune.sh qdisc --qdisc ALGO      单独更改出口队列，不改 TCP 参数
   ./bbr-tune.sh status [--iface DEV]         查看当前 TCP/BBR 状态
   ./bbr-tune.sh history                      查看历史测试会话
+  ./bbr-tune.sh history-compare --session ID  对比当前、测试前及历史选中参数
+  ./bbr-tune.sh history-params --session ID   查看历史会话测试前的原始参数
+  sudo ./bbr-tune.sh apply-history --session ID [--persist]  应用历史测试的 TCP 参数
+  sudo ./bbr-tune.sh update                  从 GitHub 更新工具
   sudo ./bbr-tune.sh kernel [操作]         BBRv3 内核检测、安装、试用与恢复
   sudo ./bbr-tune.sh confirm                 确认保留当前参数并取消安全回滚
   sudo ./bbr-tune.sh rollback [--backup DIR] 恢复调优前参数
+  sudo ./bbr-tune.sh cleanup-backups         交互清理历史备份（保留原始备份）
 
 自动寻优参数：
   --bandwidth-mbps N       期望的端到端下载带宽，单位 Mbps，必填
@@ -343,7 +351,7 @@ parse_args() {
   fi
   case "$1" in
     kernel) COMMAND=kernel; shift; KERNEL_ARGS=("$@"); return ;;
-    menu|autotune|qdisc|status|history|confirm|rollback|help) COMMAND="$1"; shift ;;
+    menu|autotune|qdisc|status|history|history-compare|history-params|apply-history|update|confirm|rollback|cleanup-backups|help) COMMAND="$1"; shift ;;
     --help|-h) COMMAND="help"; shift ;;
     --version) printf '%s %s\n' "$PROGRAM" "$VERSION"; exit 0 ;;
     *) die "未知命令：$1" ;;
@@ -363,6 +371,8 @@ parse_args() {
       --target-utilization) need_value "$@"; TARGET_UTILIZATION="$2"; shift 2 ;;
       --max-retrans-percent) need_value "$@"; MAX_RETRANS_PERCENT="$2"; shift 2 ;;
       --backup) need_value "$@"; BACKUP_PATH="$2"; shift 2 ;;
+      --session) need_value "$@"; HISTORY_SESSION="$2"; shift 2 ;;
+      --after) HISTORY_PARAMS_AFTER="1"; shift ;;
       --persist) PERSIST_FINAL="1"; shift ;;
       --force) FORCE="1"; shift ;;
       --yes|-y) YES="1"; shift ;;
@@ -1411,6 +1421,32 @@ backup_file() {
   fi
 }
 
+backup_is_restorable() {
+  [[ -r "$1/meta.env" && -r "$1/files.tsv" && -r "$1/sysctl.tsv" && -r "$1/qdisc.txt" ]]
+}
+
+original_backup_path() {
+  local id path marker="${BACKUP_ROOT%/*}/original-backup"
+  if [[ -e "$marker" || -L "$marker" ]]; then
+    [[ -f "$marker" && ! -L "$marker" ]] || { error "原始备份标记无效：$marker"; return 1; }
+    IFS= read -r id <"$marker" || return 1
+    [[ -n "$id" && "$id" != . && "$id" != .. && "$id" != */* && -d "$BACKUP_ROOT/$id" && ! -L "$BACKUP_ROOT/$id" ]] && backup_is_restorable "$BACKUP_ROOT/$id" || {
+      error "原始备份标记指向无效目录：$marker"; return 1;
+    }
+  else
+    # Older installations have no marker. Their earliest session remains protected.
+    for path in "$BACKUP_ROOT"/*; do
+      [[ -d "$path" && ! -L "$path" ]] && backup_is_restorable "$path" || continue
+      id="${path##*/}"
+      printf '%s\n' "$id" >"${marker}.tmp.$$" || return 1
+      mv -f "${marker}.tmp.$$" "$marker" || return 1
+      break
+    done
+    [[ -n "${id:-}" ]] || return 1
+  fi
+  printf '%s/%s\n' "$BACKUP_ROOT" "$id"
+}
+
 create_backup() {
   local iface="$1" backup key value layout service_enabled="unknown" service_active="unknown"
   backup="${BACKUP_ROOT}/${SESSION_ID}"
@@ -1453,8 +1489,67 @@ EOF_META
     value="$(sysctl_get "$key")"
     printf '%s\t%s\n' "$key" "${value:-<内核不支持>}" >>"${backup}/observed.tsv"
   done
+  original_backup_path >/dev/null || return 1
   ln -sfn "$backup" "$LATEST_BACKUP"
   printf '%s\n' "$backup"
+}
+
+cleanup_backups_interactive() {
+  local original backup selected selected_real choice index answer latest newest
+  local -a backups=()
+  [[ -d "$BACKUP_ROOT" && ! -L "$BACKUP_ROOT" ]] || { info "当前没有备份可清理"; return 0; }
+  original="$(original_backup_path)" || { error "无法确认原始备份，已停止清理"; return 1; }
+  while true; do
+    backups=()
+    for backup in "$BACKUP_ROOT"/*; do
+      [[ -d "$backup" && ! -L "$backup" ]] && backups+=("$backup")
+    done
+    section "清理历史备份"
+    printf '  原始备份永久保留；待确认的安全回滚备份不可删除。\n'
+    for index in "${!backups[@]}"; do
+      backup="${backups[$index]}"
+      if [[ "$backup" == "$original" ]]; then
+        printf '  %2d  %s  [原始备份，保留]\n' "$((index+1))" "${backup##*/}"
+      elif [[ -f "$(pending_path "$backup")/armed" ]]; then
+        printf '  %2d  %s  [等待安全回滚，保留]\n' "$((index+1))" "${backup##*/}"
+      else
+        printf '  %2d  %s\n' "$((index+1))" "${backup##*/}"
+      fi
+    done
+    printf '   0  返回\n'
+    read -r -p '请输入要删除的备份编号：' choice || return 0
+    [[ "$choice" != 0 && -n "$choice" ]] || return 0
+    [[ "$choice" =~ ^[0-9]{1,4}$ ]] || { warn "请输入列表中的编号"; continue; }
+    index=$((10#$choice - 1))
+    (( index >= 0 && index < ${#backups[@]} )) || { warn "请输入列表中的编号"; continue; }
+    selected="${backups[$index]}"
+    [[ "$selected" != "$original" ]] || { warn "原始备份不能删除"; continue; }
+    [[ ! -f "$(pending_path "$selected")/armed" ]] || { warn "该备份仍受安全回滚保护，请先确认或恢复参数"; continue; }
+    read -r -p "确认永久删除 ${selected##*/}？[y/N] " answer || return 0
+    [[ "$answer" =~ ^[Yy]$ ]] || continue
+    # Recheck just before removal, including the path type and protected marker.
+    original="$(original_backup_path)" || { error "无法确认原始备份，已停止清理"; return 1; }
+    [[ -d "$selected" && ! -L "$selected" && "$selected" != "$original" && ! -f "$(pending_path "$selected")/armed" ]] || {
+      warn "备份状态已变化，未删除"; continue;
+    }
+    latest="$(readlink -f "$LATEST_BACKUP" 2>/dev/null || true)"
+    selected_real="$(readlink -f "$selected" 2>/dev/null || true)"
+    rm -rf -- "$selected" || { error "删除失败：$selected"; return 1; }
+    if [[ "$latest" == "$selected_real" ]]; then
+      newest=""
+      for backup in "$BACKUP_ROOT"/*; do
+        [[ -d "$backup" && ! -L "$backup" ]] && backup_is_restorable "$backup" && newest="$backup"
+      done
+      if [[ -n "$newest" ]]; then ln -sfn "$newest" "$LATEST_BACKUP"; else rm -f "$LATEST_BACKUP"; fi
+    fi
+    info "已删除备份：$selected"
+  done
+}
+
+cleanup_backups_command() {
+  require_linux; require_root
+  [[ -t 0 ]] || die "清理备份需要交互终端"
+  cleanup_backups_interactive
 }
 
 restore_files() {
@@ -2894,8 +2989,219 @@ status_command() {
   printf '\n队列详细统计\n------------\n'
   tc -s -d qdisc show dev "$iface" || true
 }
+
+history_snapshot_value() {
+  local file="$1" key="$2" value
+  if [[ -r "$file" ]]; then
+    value="$(awk -v key="$key" 'index($0,key"=")==1 {print substr($0,length(key)+2); exit}' "$file")"
+  fi
+  printf '%s\n' "${value:-未记录}"
+}
+
+history_snapshot_qdisc() {
+  local file="$1" value
+  if [[ -r "$file" ]]; then
+    value="$(awk '/^\[qdisc\]$/ {inside=1; next} /^\[/ {inside=0} inside && $1=="qdisc" && $4=="root" {print $2; exit}' "$file")"
+  fi
+  printf '%s\n' "${value:-未记录}"
+}
+
+history_compare_format_value() {
+  local value="$1" format="$2"
+  case "$format" in
+    bytes)
+      if [[ "$value" =~ ^[0-9]+$ ]]; then
+        awk -v n="$value" 'BEGIN {printf "%.2f MiB (%s bytes)\n",n/1048576,n}'
+      else printf '%s\n' "$value"; fi ;;
+    mib)
+      if [[ "$value" =~ ^[0-9]+$ ]]; then printf '%s MiB\n' "$value"
+      else printf '%s\n' "$value"; fi ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+
+history_compare_row() {
+  local label="$1" key="$2" current_file="$3" before_file="$4" after_file="$5" format="${6:-raw}"
+  local current before selected marker=""
+  if [[ "$format" == qdisc ]]; then
+    current="$(history_snapshot_qdisc "$current_file")"
+    before="$(history_snapshot_qdisc "$before_file")"
+    selected="$(history_snapshot_qdisc "$after_file")"
+  else
+    current="$(history_snapshot_value "$current_file" "$key")"
+    before="$(history_snapshot_value "$before_file" "$key")"
+    selected="$(history_snapshot_value "$after_file" "$key")"
+  fi
+  current="$(history_compare_format_value "$current" "$format")"
+  before="$(history_compare_format_value "$before" "$format")"
+  selected="$(history_compare_format_value "$selected" "$format")"
+  [[ "$selected" == "$current" || "$selected" == 未记录 ]] || marker='← 与当前不同'
+  if (( ${#label} + ${#current} + ${#before} + ${#selected} <= 34 )); then
+    printf '  %s：当前 %s｜测试前 %s｜历史 %s%s%s%s\n' \
+      "$label" "$current" "$before" "$UI_YELLOW" "$selected" "$UI_RESET" "$marker"
+  else
+    printf '  %s\n' "$label"
+    printf '    当前       %s\n' "$current"
+    printf '    测试前     %s\n' "$before"
+    printf '    选中历史   %s%s%s%s\n' "$UI_YELLOW" "$selected" "$UI_RESET" "$marker"
+  fi
+}
+
+history_compare_command() (
+  require_linux
+  local session="$HISTORY_SESSION" before_file after_file current_file iface
+  [[ "$session" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { error "history-compare 需要有效的 --session 会话编号"; return 1; }
+  [[ -d "${SESSION_ROOT}/${session}" && ! -L "${SESSION_ROOT}/${session}" ]] || { error "找不到历史会话：${session}"; return 1; }
+  before_file="${SESSION_ROOT}/${session}/system-before.txt"
+  after_file="${SESSION_ROOT}/${session}/system-after.txt"
+  [[ -r "$before_file" || -r "$after_file" ]] || { error "该会话没有保存参数快照：${session}"; return 1; }
+  iface="$(resolve_iface)"
+  [[ -n "$iface" ]] || { error "无法识别当前出口网卡"; return 1; }
+  detect_memory_limits
+  current_file="$(mktemp)" || return 1
+  trap 'rm -f "$current_file"' EXIT
+  capture_state "$iface" "$current_file"
+  section "历史会话 ${session} / 关键参数对比"
+  printf '  当前＝现在生效；测试前＝这次测试的原始值；选中历史＝这次测试结束时的值。\n'
+  printf '  ← 标出与当前不同的历史值；未记录表示当时没有保存。\n'
+  printf '\n  TCP / BBR 参数\n'
+  history_compare_row '拥塞控制算法' net.ipv4.tcp_congestion_control "$current_file" "$before_file" "$after_file"
+  history_compare_row '接收缓存硬上限' net.core.rmem_max "$current_file" "$before_file" "$after_file" bytes
+  history_compare_row '发送缓存硬上限' net.core.wmem_max "$current_file" "$before_file" "$after_file" bytes
+  history_compare_row 'tcp_rmem（最小/默认/最大，bytes）' net.ipv4.tcp_rmem "$current_file" "$before_file" "$after_file"
+  history_compare_row 'tcp_wmem（最小/默认/最大，bytes）' net.ipv4.tcp_wmem "$current_file" "$before_file" "$after_file"
+  history_compare_row 'tcp_mem（low/pressure/high，页）' net.ipv4.tcp_mem "$current_file" "$before_file" "$after_file"
+  printf '\n  队列与服务器条件（用于判断测试环境）\n'
+  history_compare_row '系统默认队列' net.core.default_qdisc "$current_file" "$before_file" "$after_file"
+  history_compare_row '出口实际队列' qdisc "$current_file" "$before_file" "$after_file" qdisc
+  history_compare_row '出口网卡' interface "$current_file" "$before_file" "$after_file"
+  history_compare_row '运行内核' kernel "$current_file" "$before_file" "$after_file"
+  history_compare_row 'BBR 运行版本' bbr_runtime_version "$current_file" "$before_file" "$after_file"
+  history_compare_row '内核可用算法' net.ipv4.tcp_available_congestion_control "$current_file" "$before_file" "$after_file"
+  history_compare_row '物理总内存' memory_total_mib "$current_file" "$before_file" "$after_file" mib
+  history_compare_row '有效总内存' memory_effective_mib "$current_file" "$before_file" "$after_file" mib
+  history_compare_row 'TCP 聚合内存预算' memory_tcp_budget_mib "$current_file" "$before_file" "$after_file" mib
+  history_compare_row '单 socket 缓存技术上限' memory_buffer_cap_mib "$current_file" "$before_file" "$after_file" mib
+  printf '\n  应用历史记录时：采用历史缓存上限，保留当前队列和 TCP 缓存最小/默认值，\n'
+  printf '  tcp_mem 会按当前内存重新计算；历史列是当时实测值，并非逐项原样写入。\n'
+  printf '  还会启用 TCP 自动缓冲、SACK/DSACK 和窗口缩放。\n'
+)
+
+history_params_command() {
+  local session="$HISTORY_SESSION" snapshot label
+  [[ "$session" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { error "history-params 需要有效的 --session 会话编号"; return 1; }
+  [[ -d "${SESSION_ROOT}/${session}" && ! -L "${SESSION_ROOT}/${session}" ]] || { error "找不到历史会话：${session}"; return 1; }
+  if (( HISTORY_PARAMS_AFTER )); then
+    snapshot="${SESSION_ROOT}/${session}/system-after.txt"
+    label="测试后"
+  else
+    snapshot="${SESSION_ROOT}/${session}/system-before.txt"
+    label="测试前"
+  fi
+  [[ -r "$snapshot" ]] || { error "该历史会话没有保存${label}原始参数：${snapshot}"; return 1; }
+  section "历史会话 ${session} / ${label}原始参数"
+  cat -- "$snapshot"
+  printf '\n  快照文件：%s\n' "$snapshot"
+  printf '  这是当时保存的参数；当前生效参数请查看“当前状态”。\n'
+}
+
+history_candidate() {
+  local session="$1" header record result_file state_file bytes line
+  [[ "$session" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { error "历史会话编号无效"; return 1; }
+  [[ -r "$HISTORY_FILE" && -d "${SESSION_ROOT}/${session}" && ! -L "${SESSION_ROOT}/${session}" ]] || {
+    error "找不到历史会话或历史索引：${session}"; return 1;
+  }
+  IFS= read -r header <"$HISTORY_FILE" || return 1
+  [[ "$header" == *$'before_single_mbps\tafter_single_mbps'* ]] || { error "历史索引字段不受支持"; return 1; }
+  record="$(awk -F '\t' -v wanted="$session" '
+    NR>1 && $2==wanted {
+      if (NF!=30) exit 2
+      count++
+      printf "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n",$1,$3,$4,$18,$19,$21,$7,$10
+    }
+    END {if (count!=1) exit 1}
+  ' "$HISTORY_FILE")" || { error "历史索引中缺少唯一且完整的会话：${session}"; return 1; }
+  HISTORY_FIELDS=()
+  while IFS= read -r line; do HISTORY_FIELDS+=("$line"); done <<<"$record"
+  local mib="${HISTORY_FIELDS[3]}"
+  [[ "$mib" =~ ^[0-9]{1,4}$ ]] && (( 10#$mib >= 1 && 10#$mib <= TCP_BUFFER_SYSCTL_MAX_MIB )) || {
+    error "历史缓存值无效：${mib}"; return 1;
+  }
+  bytes=$(( 10#$mib * 1048576 ))
+  result_file="${SESSION_ROOT}/${session}/results.tsv"
+  state_file="${SESSION_ROOT}/${session}/system-after.txt"
+  [[ -r "$result_file" && -r "$state_file" ]] || { error "历史会话缺少最终复核或生效状态记录，无法直接应用"; return 1; }
+  awk -F '\t' -v mib="$((10#$mib))" '
+    $1=="final" {count++; if ($6!=mib || ($3!="single" && $3!="multi")) invalid=1; seen[$3]=1}
+    END {exit (invalid || count!=2 || !seen["single"] || !seen["multi"])}
+  ' "$result_file" || { error "历史最终复核与汇总缓存值不一致，拒绝应用"; return 1; }
+  grep -Fqx "net.core.rmem_max=${bytes}" "$state_file" &&
+    grep -Fqx "net.core.wmem_max=${bytes}" "$state_file" || {
+      error "历史生效状态与汇总缓存值不一致，拒绝应用"; return 1;
+    }
+}
+
+apply_history_command() {
+  require_linux; require_root
+  [[ -n "$HISTORY_SESSION" ]] || die "apply-history 需要 --session 会话编号"
+  [[ "$REQUESTED_QDISC" == auto || "$REQUESTED_QDISC" == keep ]] || die "应用历史参数时保留当前队列；单独切换队列请使用 qdisc 命令"
+  history_candidate "$HISTORY_SESSION" || die "历史记录未通过校验"
+  local historical_time="${HISTORY_FIELDS[0]}" historical_mib="${HISTORY_FIELDS[3]}"
+  local historical_outcome="${HISTORY_FIELDS[4]}" iface buffer_bytes
+  TARGET_MBPS="${HISTORY_FIELDS[1]}"; RTT_MS="${HISTORY_FIELDS[2]}"; STRATEGY="${HISTORY_FIELDS[5]}"
+  is_number "$TARGET_MBPS" && is_number "$RTT_MS" || die "历史目标带宽或 RTT 无效"
+  configure_strategy
+  for cmd in ip tc sysctl modprobe awk mktemp tee; do have "$cmd" || die "服务器缺少命令：$cmd"; done
+  iface="$(resolve_iface)"
+  [[ -n "$iface" ]] && ip link show dev "$iface" >/dev/null 2>&1 || die "无法识别当前出口网卡"
+  detect_memory_limits
+  calculate_bdp
+  (( 10#$historical_mib <= MEM_BUFFER_CAP_MIB )) || die "历史缓存 ${historical_mib} MiB 超过当前服务器上限 ${MEM_BUFFER_CAP_MIB} MiB"
+  prepare_tcp_rules
+  buffer_bytes=$(( 10#$historical_mib * 1048576 ))
+  (( buffer_bytes >= TCP_RDEFAULT && buffer_bytes >= TCP_WDEFAULT )) || die "历史缓存低于当前 TCP 默认缓存，无法应用"
+  REQUESTED_QDISC=keep
+  section "应用历史测试参数"
+  printf '  历史会话：%s（%s）\n' "$HISTORY_SESSION" "$historical_time"
+  printf '  当时结论：%s；单连接 %s Mbps，多连接 %s Mbps\n' "$historical_outcome" "${HISTORY_FIELDS[6]}" "${HISTORY_FIELDS[7]}"
+  printf '  待应用：BBR、TCP 自动缓冲及 %s MiB 缓存上限\n' "$historical_mib"
+  printf '  当前网卡：%s；保留当前出口队列和整形设置\n' "$iface"
+  printf '  TCP 聚合内存阈值按当前服务器内存重新计算\n'
+  printf '  开机配置：%s；安全回滚：%s 秒\n' "$([[ "$PERSIST_FINAL" == 1 ]] && echo 写入 || echo 不写入)" "$AUTO_ROLLBACK_SECONDS"
+  printf '  历史测速不会代表当前链路表现；应用后请从独立 SSH 会话验证业务。\n'
+  if (( ! YES )); then
+    [[ -t 0 ]] || die "非交互应用历史参数需要 --yes"
+    local answer
+    read -r -p '确认备份当前参数并应用？[y/N] ' answer || return 0
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  fi
+  init_session
+  select_tuning_qdisc "$iface" || die "无法验证当前队列布局，尚未修改 TCP 参数"
+  ensure_bbr
+  BACKUP_DIR="$(create_backup "$iface")"
+  TUNING_ACTIVE=1
+  trap cleanup_tuning_on_exit EXIT
+  trap stop_tuning_on_signal INT TERM HUP
+  pending_guard
+  schedule_rollback "$BACKUP_DIR"
+  apply_candidate "$iface" "$((10#$historical_mib))"
+  if (( PERSIST_FINAL )); then write_persistent_config "$iface" "$((10#$historical_mib))"; fi
+  capture_state "$iface" "${SESSION_DIR}/system-after.txt"
+  {
+    printf '历史参数应用记录\n来源会话：%s\n来源时间：%s\n' "$HISTORY_SESSION" "$historical_time"
+    printf 'TCP 缓存上限：%s MiB\n当前出口网卡：%s\n当前队列：保留\n' "$historical_mib" "$iface"
+    printf '开机配置：%s\n安全回滚：%s 秒\n' "$([[ "$PERSIST_FINAL" == 1 ]] && echo 已写入 || echo 未写入)" "$AUTO_ROLLBACK_SECONDS"
+  } >"${SESSION_DIR}/history-application.txt"
+  rm -f "$(pending_path "$BACKUP_DIR")/owner"
+  TUNING_ACTIVE=0
+  trap - EXIT INT TERM HUP
+  info "历史 TCP 参数已应用；请验证业务后执行 sudo $PROGRAM confirm"
+  info "本次备份：$BACKUP_DIR"
+  info "应用记录：${SESSION_DIR}/history-application.txt"
+}
+
 history_command() {
-  local header
+  local header choice count selected action snapshot_choice
   if [[ ! -r "$HISTORY_FILE" ]]; then info "尚无历史测试记录；完成一次调优后即可在此对比"; return; fi
   IFS= read -r header <"$HISTORY_FILE" || header=""
   section "历史测试 / 按时间归档"
@@ -2903,7 +3209,7 @@ history_command() {
     awk -F '\t' '
       function strategy(s) {if(s=="speed")return "速度优先";if(s=="stable")return "稳定优先";if(s=="retrans")return "低重传优先";return "均衡"}
       NR>1 {
-        printf "\n  %s  /  %s\n", $1,strategy($21)
+        printf "\n  %d) %s  /  %s\n", NR-1,$1,strategy($21)
         printf "  会话：%s\n",$2
         printf "  单连接：%s → %s Mbps（%s%%）\n",$6,$7,$8
         printf "  多连接：%s → %s Mbps（%s%%）\n",$9,$10,$11
@@ -2912,10 +3218,94 @@ history_command() {
         printf "  报告：%s\n",$20
       }' "$HISTORY_FILE"
     printf '\n  历史结论仅反映当时测试；当前生效参数请查看“当前状态”。\n'
+    if [[ -t 0 && -t 1 ]]; then
+      count="$(awk 'END {print NR-1}' "$HISTORY_FILE")"
+      (( count > 0 )) || return 0
+      while true; do
+        read -r -p '输入编号查看关键参数对比（0 返回）：' choice || return 0
+        [[ "$choice" == 0 || -z "$choice" ]] && return 0
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice >= 1 && 10#$choice <= count )); then break; fi
+        printf '请输入 0～%s 的编号\n' "$count"
+      done
+      selected="$(awk -F '\t' -v n="$choice" 'NR==n+1 {print $2}' "$HISTORY_FILE")"
+      HISTORY_SESSION="$selected"
+      history_compare_command || true
+      while true; do
+        printf '\n会话 %s\n' "$selected"
+        printf '  1  重新查看关键参数对比\n  2  应用本次测试的 TCP 参数\n  3  查看完整原始快照\n  0  返回\n'
+        read -r -p '请选择：' action || return 0
+        case "$action" in
+          1) history_compare_command || true ;;
+          2)
+            history_candidate "$selected" || continue
+            local args=()
+            if ui_yes_no '同时写入开机配置' n; then args+=(--persist); fi
+            ui_execute 1 apply-history --session "$selected" ${args[@]+"${args[@]}"} || true
+            ;;
+          3)
+            read -r -p '查看 1 测试前 / 2 测试后（0 返回）：' snapshot_choice || continue
+            case "$snapshot_choice" in
+              1) HISTORY_PARAMS_AFTER=0; history_params_command || true ;;
+              2) HISTORY_PARAMS_AFTER=1; history_params_command || true ;;
+              0|'') ;;
+              *) printf '请输入 0～2 的编号\n' ;;
+            esac
+            ;;
+          0|'') return 0 ;;
+          *) printf '请输入 0～3 的编号\n' ;;
+        esac
+      done
+    fi
   else
     warn "这是旧版历史记录；请按首行字段查看原文件：$HISTORY_FILE"
   fi
 }
+
+download_update_installer() {
+  local url="$1" destination="$2"
+  if have curl; then
+    curl -fL --retry 3 --connect-timeout 15 --max-time 120 -H 'Cache-Control: no-cache' "$url" -o "$destination"
+  elif have wget; then
+    wget -T 30 -t 3 -O "$destination" "$url"
+  else
+    error "缺少 curl 或 wget，无法下载更新文件"
+    return 1
+  fi
+}
+
+update_command() (
+  require_linux; require_root
+  local base temp_dir installer nonce installed_version installed_path metadata sha
+  base='https://raw.githubusercontent.com/dingding229/bbr-tune/main'
+  nonce="$$-$RANDOM-$RANDOM"
+  temp_dir="$(mktemp -d /tmp/bbr-tune-update.XXXXXX)" || { error "无法创建更新临时目录"; return 1; }
+  trap 'rm -rf "$temp_dir"' EXIT
+  installer="${temp_dir}/install.sh"
+  metadata="${temp_dir}/commit.json"
+  section "从 GitHub 更新 BBR TUNE"
+  download_update_installer "https://api.github.com/repos/dingding229/bbr-tune/commits/main?bbr_tune_refresh=${nonce}" "$metadata" || { error "无法查询最新提交"; return 1; }
+  sha="$(grep -oEm1 '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' "$metadata" | head -n 1 | grep -oE '[0-9a-f]{40}' || true)"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { error "更新渠道未返回有效的提交编号"; return 1; }
+  base="${base%/main}/${sha}"
+  printf '  下载来源：%s\n' "$base"
+  download_update_installer "${base}/install.sh?bbr_tune_refresh=${nonce}" "$installer" || { error "安装器下载失败，当前版本未修改"; return 1; }
+  [[ -s "$installer" ]] && head -n 1 "$installer" | grep -q '^#!/usr/bin/env bash' && bash -n "$installer" || {
+    error "下载的安装器无效，当前版本未修改"; return 1;
+  }
+  if BBR_TUNE_RAW_BASE="$base" BBR_TUNE_DOWNLOAD_NONCE="$nonce" bash "$installer" --install-only; then
+    installed_path="${BBR_TUNE_INSTALL_PATH:-/usr/local/sbin/bbr-tune}"
+    installed_version="$("$installed_path" --version 2>/dev/null)" || { error "安装器已执行，但无法读取安装后的版本：$installed_path"; return 1; }
+    installed_version="${installed_version##* }"
+    if [[ "$installed_version" == "$VERSION" ]]; then
+      warn "安装后仍是版本 ${VERSION}；上游尚未提供新版本，或下载内容仍被缓存"
+    else
+      info "已从 ${VERSION} 更新到 ${installed_version}；重新打开菜单即可使用新版本"
+    fi
+  else
+    error "更新未完成，请检查上方错误"
+    return 1
+  fi
+)
 
 ui_init() {
   if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR+x}" ]]; then
@@ -2939,14 +3329,16 @@ ui_menu_options() {
   printf '  调优与记录\n'
   printf '    %s1%s  自动测试并选择 TCP 参数\n' "$UI_GREEN" "$UI_RESET"
   printf '    2  查看当前 TCP / BBR 状态\n'
-  printf '    3  查看历史测试与对比\n'
+  printf '    3  查看历史测试 / 关键参数对比 / 应用\n'
   printf '\n  参数管理\n'
   printf '    4  确认保留当前参数\n'
   printf '    5  恢复调优前参数\n'
-  printf '    8  更改出口队列算法\n'
+  printf '    6  更改出口队列算法\n'
   printf '\n  工具\n'
-  printf '    6  使用说明\n'
-  printf '    7  BBRv3 内核管理\n'
+  printf '    7  使用说明\n'
+  printf '    8  BBRv3 内核管理\n'
+  printf '    9  从 GitHub 更新工具\n'
+  printf '   10  清理历史备份\n'
   printf '    0  退出\n\n'
 }
 
@@ -2996,6 +3388,16 @@ ui_execute() {
     printf '\n%s[未完成] 请按上方错误说明处理；退出码 %s%s\n' "$UI_RED" "$rc" "$UI_RESET"
   fi
   return "$rc"
+}
+
+ui_update() {
+  local base='https://raw.githubusercontent.com/dingding229/bbr-tune/main'
+  section "从 GitHub 更新工具"
+  printf '  当前版本：%s\n' "$VERSION"
+  printf '\n  将从 %s 下载并安装最新版本。\n' "$base"
+  printf '  更新完成后会重新打开主菜单。\n'
+  ui_yes_no '确认更新工具' n || return 1
+  ui_execute 1 update
 }
 
 ui_select_strategy() {
@@ -3125,7 +3527,7 @@ menu() {
   [[ -t 0 && -t 1 ]] || { usage; return; }
   require_linux
   ui_init
-  local choice
+  local choice restart_target
   while true; do
     ui_title
     ui_menu_options
@@ -3133,12 +3535,20 @@ menu() {
     case "$choice" in
       1) ui_autotune || true ;;
       2) ui_execute 0 status --iface "$IFACE" || true ;;
-      3) ui_execute 0 history || true ;;
+      3) ui_execute 1 history || true ;;
       4) ui_execute 1 confirm || true ;;
       5) ui_execute 1 rollback || true ;;
-      6) usage ;;
-      7) ui_execute 1 kernel menu || true ;;
-      8) ui_qdisc || true ;;
+      6) ui_qdisc || true ;;
+      7) usage ;;
+      8) ui_execute 1 kernel menu || true ;;
+      9)
+        if ui_update; then
+          restart_target="${BBR_TUNE_INSTALL_PATH:-/usr/local/sbin/bbr-tune}"
+          if [[ -r "$restart_target" ]]; then exec bash "$restart_target" menu; fi
+          warn "已完成更新；请重新运行 bbrtcp 打开新版菜单"
+        fi
+        ;;
+      10) ui_execute 1 cleanup-backups || true ;;
       0) return ;;
       *) printf '%s无效选择%s\n' "$UI_RED" "$UI_RESET" ;;
     esac
@@ -3153,7 +3563,7 @@ main() {
     require_linux; require_root
     stop_expired_session
   fi
-  case "$COMMAND" in autotune|qdisc|confirm|rollback) acquire_operation_lock ;; esac
+  case "$COMMAND" in autotune|qdisc|apply-history|confirm|rollback|cleanup-backups) acquire_operation_lock ;; esac
   case "$COMMAND" in
     menu) menu ;;
     autotune) autotune ;;
@@ -3161,8 +3571,13 @@ main() {
     kernel) kernel_command ;;
     status) status_command ;;
     history) history_command ;;
+    history-compare) history_compare_command ;;
+    history-params) history_params_command ;;
+    apply-history) apply_history_command ;;
+    update) update_command ;;
     confirm) confirm_tuning ;;
     rollback) rollback_command ;;
+    cleanup-backups) cleanup_backups_command ;;
     help) usage ;;
   esac
 }

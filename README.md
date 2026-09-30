@@ -1,6 +1,6 @@
 # bbr-tune 使用指南
 
-**版本 2.9.0** · 在远程 Linux 服务器上运行的 TCP / BBR 调优工具。
+**版本 2.10.4** · 在远程 Linux 服务器上运行的 TCP / BBR 调优工具。
 
 服务器执行调优，本地电脑仅运行测速命令。工具不会修改本地电脑的 TCP 参数，不会自动重启服务器，也不会自动开放防火墙端口。
 
@@ -13,19 +13,25 @@ curl -fsSL https://raw.githubusercontent.com/dingding229/bbr-tune/main/install.s
   | sudo bash
 ```
 
-仅安装或更新，不打开菜单：
+仅安装或更新，不打开菜单时，在上述命令末尾为 `bash` 添加 `-s -- --install-only`：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dingding229/bbr-tune/main/install.sh \
   | sudo bash -s -- --install-only
 ```
 
+安装当前目录中的版本时，在仓库目录执行 `sudo bash install.sh --install-only`。
+
 之后使用：
 
 ```bash
-sudo bbr-tune
+bbrtcp
 bbr-tune --version
 ```
+
+`bbrtcp` 是安装后创建的快捷命令，与 `bbr-tune` 打开同一个交互菜单。菜单中的系统修改操作会在需要时请求 `sudo` 权限；原有的 `sudo bbr-tune` 命令仍可使用。
+
+安装器和菜单更新会先查询 GitHub 上的最新提交，再从该提交的固定地址下载完整程序，避免 `main` 下载地址的缓存返回旧版文件。更新后请以安装器打印的版本号为准。
 
 运行前请准备：
 
@@ -44,20 +50,26 @@ BBR TUNE / 远程服务器网络调优
   调优与记录
     1  自动测试并选择 TCP 参数
     2  查看当前 TCP / BBR 状态
-    3  查看历史测试与对比
+    3  查看历史测试 / 关键参数对比 / 应用
 
   参数管理
     4  确认保留当前参数
     5  恢复调优前参数
-    8  更改出口队列算法
+    6  更改出口队列算法
 
   工具
-    6  使用说明
-    7  BBRv3 内核管理
+    7  使用说明
+    8  BBRv3 内核管理
+    9  从 GitHub 更新工具
+   10  清理历史备份
     0  退出
 ```
 
-选择 `1` 开始调优，可同时选择出口队列算法。只需切换队列、不运行测速时，选择 `8`。建议保持默认测试时长、并发流数和复测设置。
+选择 `1` 开始调优，可同时选择出口队列算法。只需切换队列、不运行测速时，选择 `6`。建议保持默认测试时长、并发流数和复测设置。
+
+选择 `10` 可逐个查看并交互删除历史参数备份。工具会永久保留最早的完整备份；升级前已有的备份会以最早的完整会话作为原始备份。仍在等待安全回滚的备份不可删除。删除最近一次备份后，`rollback` 默认使用剩余的最新备份。也可执行 `sudo bbr-tune cleanup-backups`。
+
+选择 `9` 可从 GitHub 更新工具。确认后会下载最新安装器并执行“仅安装更新”，完成后重新打开菜单。更新沿用安装器的操作锁、待确认回滚检查和主程序/内核助手版本匹配检查；下载或校验失败时会显示错误。也可使用 `sudo bbr-tune update`。
 
 ### 填写目标带宽
 
@@ -206,7 +218,7 @@ sudo env NO_COLOR=1 bbr-tune
 
 ### 单独切换队列
 
-在菜单中选择 `8`，或执行：
+在菜单中选择 `6`，或执行：
 
 ```bash
 # 切换为 fq，只对当前运行生效
@@ -255,7 +267,21 @@ sudo bbr-tune autotune \
 sudo bbr-tune history
 ```
 
-历史列表显示每次测试的时间、单连接及多连接变化、缓存和报告路径。历史结论不会随之后的回滚而改写，**当前生效参数以 `status` 为准**。
+历史列表显示每次测试的时间、单连接及多连接变化、缓存和报告路径。在交互终端中输入记录编号后，会直接显示**当前生效值、该次测试前原始值、该次测试后选中值**的对比；不同于当前值的历史项会标出。对比聚焦在“当前状态”页展示的 TCP/BBR、队列和内存项目，不再默认输出全部系统参数与队列统计。需要完整快照时，可从会话菜单的次级入口查看。
+
+历史列是当时实测后保存的值，不表示会逐项原样重放。选择应用时，脚本采用历史缓存上限和 BBR/TCP 调优规则，保留当前出口队列、整形设置及 TCP 缓存的最小/默认值，并按当前服务器内存重新计算 `tcp_mem`。应用前会核对历史汇总、最终复核与当时生效状态，检查当前内存上限，备份当前配置，并启用安全回滚。验证业务后执行 `sudo bbr-tune confirm`，否则默认在 3600 秒后回滚。历史结论不会随之后的回滚而改写，**当前生效参数以 `status` 为准**。
+
+也可以按会话编号直接操作（非交互应用参数时须加 `--yes`）：
+
+```bash
+sudo bbr-tune history-compare --session 20260929-183916-417057
+sudo bbr-tune history-params --session 20260929-183916-417057
+sudo bbr-tune history-params --session 20260929-183916-417057 --after
+sudo bbr-tune apply-history --session 20260929-183916-417057
+sudo bbr-tune apply-history --session 20260929-183916-417057 --persist
+```
+
+缺少最终复核或生效状态文件的旧记录仍可查看，但不能直接应用。
 
 日志目录：
 
@@ -273,6 +299,7 @@ sudo bbr-tune history
     sysctl-comparison.tsv       参数前后对比
     system-before.txt           调优前状态
     system-after.txt            调优后状态
+    history-application.txt     从历史记录应用参数时的操作记录
     *.json                      iperf3 原始结果
     *.err                       连接和结果校验诊断
   backups/<会话编号>/             参数与配置备份
@@ -290,7 +317,7 @@ sudo tail -f /var/lib/bbr-tcp-tuning/sessions/会话编号/run.log
 
 ## 8. BBRv3 内核管理（可选）
 
-TCP 调优不要求先更换内核。只有确有需要且具备云控制台或救援访问时，才使用菜单 `7`。
+TCP 调优不要求先更换内核。只有确有需要且具备云控制台或救援访问时，才使用菜单 `8`。
 
 内核来自 **byJoey/Actions-bbr-v3 的预编译标准版**。不使用 Max 版，不在服务器编译，不执行上游安装脚本。第三方内核存在驱动和启动兼容风险；保留旧内核不等于保证自动恢复。
 
@@ -349,7 +376,7 @@ sudo bbr-tune kernel fallback
 
 ### 提示自定义队列为 cake，无法开始调优
 
-更新后重新运行 `sudo bbr-tune`。默认 `auto` 会保留 CAKE 并继续 TCP 调优；如需更换算法，可通过菜单 `8` 或 `--qdisc` 明确选择，不需要使用 `--force` 绕过检查。
+更新后重新运行 `sudo bbr-tune`。默认 `auto` 会保留 CAKE 并继续 TCP 调优；如需更换算法，可通过菜单 `6` 或 `--qdisc` 明确选择，不需要使用 `--force` 绕过检查。
 
 检测到现有 CAKE 队列时，工具会保留整个队列布局及其带宽、流量分类等设置，继续测试并选择 TCP/BBR 参数。报告会显示实际队列，不会把该次测试标记为 `fq`。若 CAKE 配置了整形带宽，测试仍受该带宽约束；增加 TCP 缓存不会取消该限制。
 

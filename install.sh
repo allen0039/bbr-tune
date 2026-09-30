@@ -2,14 +2,13 @@
 # install.sh - bbr-tune 一键安装与启动脚本
 set -Eeuo pipefail
 
-REPOSITORY="dingding229/bbr-tune"
-BRANCH="main"
-RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/${BRANCH}"
+RAW_BASE="${BBR_TUNE_RAW_BASE:-https://raw.githubusercontent.com/dingding229/bbr-tune/main}"
 INSTALL_PATH="${BBR_TUNE_INSTALL_PATH:-/usr/local/sbin/bbr-tune}"
 LINK_PATH="${BBR_TUNE_LINK_PATH:-/usr/local/bin/bbr-tune}"
 LAUNCH_AFTER_INSTALL="1"
 TEMP_FILE=""
 TEMP_KERNEL_FILE=""
+DOWNLOAD_NONCE="${BBR_TUNE_DOWNLOAD_NONCE:-$$-$RANDOM-$RANDOM}"
 
 log() { printf '[安装] %s\n' "$*"; }
 warn() { printf '[警告] %s\n' "$*" >&2; }
@@ -33,6 +32,7 @@ bbr-tune 一键安装脚本
 安装位置：
   /usr/local/sbin/bbr-tune
   /usr/local/bin/bbr-tune -> /usr/local/sbin/bbr-tune
+  /usr/local/bin/bbrtcp -> /usr/local/sbin/bbr-tune
 USAGE
 }
 
@@ -100,14 +100,37 @@ local_payload_path() {
 
 download_payload() {
   local destination="$1" filename="${2:-bbr-tune.sh}"
-  local url="${RAW_BASE}/${filename}"
+  local url="${RAW_BASE}/${filename}?bbr_tune_refresh=${DOWNLOAD_NONCE}"
   if have curl; then
-    curl -fL --retry 3 --connect-timeout 15 "$url" -o "$destination"
+    curl -fL --retry 3 --connect-timeout 15 -H 'Cache-Control: no-cache' "$url" -o "$destination"
   elif have wget; then
     wget -O "$destination" "$url"
   else
     die "服务器缺少 curl 或 wget，无法下载主程序"
   fi
+}
+
+resolve_remote_base() {
+  local api metadata sha
+  case "$RAW_BASE" in
+    https://raw.githubusercontent.com/dingding229/bbr-tune/main)
+      api='https://api.github.com/repos/dingding229/bbr-tune/commits/main' ;;
+    *) return 0 ;;
+  esac
+  metadata="$(mktemp /tmp/bbr-tune-commit.XXXXXX)"
+  if have curl; then
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 -H 'Cache-Control: no-cache' "${api}?bbr_tune_refresh=${DOWNLOAD_NONCE}" -o "$metadata" || { rm -f "$metadata"; die "无法查询更新渠道的最新提交"; }
+  elif have wget; then
+    wget -T 30 -t 3 -O "$metadata" "${api}?bbr_tune_refresh=${DOWNLOAD_NONCE}" || { rm -f "$metadata"; die "无法查询更新渠道的最新提交"; }
+  else
+    rm -f "$metadata"
+    die "缺少 curl 或 wget，无法查询最新提交"
+  fi
+  sha="$(grep -oEm1 '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' "$metadata" | head -n 1 | grep -oE '[0-9a-f]{40}' || true)"
+  rm -f "$metadata"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "更新渠道未返回有效的提交编号"
+  RAW_BASE="${RAW_BASE%/main}/${sha}"
+  log "固定下载提交：${sha:0:12}"
 }
 
 validate_payload() {
@@ -117,19 +140,46 @@ validate_payload() {
   bash -n "$source_file" || die "主程序语法检查失败"
 }
 
+version_is_older() {
+  local candidate="$1" current="$2" i
+  local -a candidate_parts current_parts
+  [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r -a candidate_parts <<<"$candidate"
+  IFS=. read -r -a current_parts <<<"$current"
+  for i in 0 1 2; do
+    if (( 10#${candidate_parts[i]} < 10#${current_parts[i]} )); then return 0; fi
+    if (( 10#${candidate_parts[i]} > 10#${current_parts[i]} )); then return 1; fi
+  done
+  return 1
+}
+
 install_payload() {
   local source_file="$1" install_path="${2:-$INSTALL_PATH}" link_path="${3:-$LINK_PATH}"
-  local helper="${4:-${source_file%/*}/bbr-kernel.sh}" version helper_version
+  local helper="${4:-${source_file%/*}/bbr-kernel.sh}" version helper_version shortcut_path installed_version
   validate_payload "$source_file"
   validate_payload "$helper"
   version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$source_file")"
   helper_version="$(sed -n 's/^KERNEL_HELPER_VERSION="\([^"]*\)"$/\1/p' "$helper")"
   [[ -n "$version" && "$version" == "$helper_version" ]] || die "主程序与内核管理脚本版本不匹配，未安装"
+  if [[ -x "$install_path" ]]; then
+    installed_version="$("$install_path" --version 2>/dev/null || true)"
+    installed_version="${installed_version##* }"
+    version_is_older "$version" "$installed_version" && die "下载版本 ${version} 低于已安装版本 ${installed_version}，已拒绝降级"
+  fi
+  shortcut_path="$(dirname "$link_path")/bbrtcp"
+  if [[ "$shortcut_path" != "$install_path" && "$shortcut_path" != "$link_path" ]] &&
+     { [[ -e "$shortcut_path" ]] || [[ -L "$shortcut_path" ]]; } &&
+     { [[ ! -L "$shortcut_path" ]] || [[ "$(readlink "$shortcut_path")" != "$install_path" ]]; }; then
+    die "快捷命令已被其他文件占用：$shortcut_path"
+  fi
   mkdir -p "$(dirname "$install_path")" "$(dirname "$link_path")"
   install -m 0755 "$helper" "${install_path}-kernel"
   install -m 0755 "$source_file" "$install_path"
   if [[ "$link_path" != "$install_path" ]]; then
     ln -sfn "$install_path" "$link_path"
+  fi
+  if [[ "$shortcut_path" != "$install_path" && "$shortcut_path" != "$link_path" ]]; then
+    ln -sfn "$install_path" "$shortcut_path"
   fi
 }
 
@@ -171,7 +221,8 @@ main() {
     cp "$source_file" "$TEMP_FILE"
     cp "${source_file%/*}/bbr-kernel.sh" "$TEMP_KERNEL_FILE"
   else
-    log "正在从 GitHub 下载最新主程序"
+    resolve_remote_base
+    log "正在从 ${RAW_BASE} 下载最新主程序"
     download_payload "$TEMP_FILE"
     download_payload "$TEMP_KERNEL_FILE" bbr-kernel.sh
   fi
@@ -179,6 +230,7 @@ main() {
   install_payload "$TEMP_FILE" "$INSTALL_PATH" "$LINK_PATH" "$TEMP_KERNEL_FILE"
   log "安装完成：$INSTALL_PATH"
   log "命令入口：$LINK_PATH"
+  log "快捷入口：$(dirname "$LINK_PATH")/bbrtcp"
   "$LINK_PATH" --version
 
   cleanup
