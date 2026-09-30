@@ -9,7 +9,7 @@ trap 'rm -rf "$tmp"' EXIT
 require_linux() { :; }; require_root() { :; }
 export UPDATE_TEST_LOG="$tmp/installer.log"
 export BBR_TUNE_INSTALL_PATH="$tmp/installed-bbr-tune"
-export UPDATE_TEST_INSTALLED_VERSION="2.10.4"
+export UPDATE_TEST_INSTALLED_VERSION="$VERSION"
 UPDATE_TEST_SHA='7ef501bf6eb5e546dd0a2bdcf0dcbce537e1b134'
 download_update_installer() {
   printf '%s\n' "$1" >>"$tmp/download-urls"
@@ -28,10 +28,10 @@ update_command >"$tmp/github.out" 2>&1 || fail 'GitHub update failed'
 [[ "$(cat "$tmp/installer.log")" == "https://raw.githubusercontent.com/dingding229/bbr-tune/${UPDATE_TEST_SHA}|--install-only" ]] || fail 'GitHub source not passed to installer'
 grep -q "https://api.github.com/repos/dingding229/bbr-tune/commits/main?bbr_tune_refresh=" "$tmp/download-urls" || fail 'GitHub commit API not used'
 grep -q "https://raw.githubusercontent.com/dingding229/bbr-tune/${UPDATE_TEST_SHA}/install.sh?bbr_tune_refresh=" "$tmp/download-urls" || fail 'GitHub installer not pinned to commit'
-grep -q '仍是版本 2.10.4' "$tmp/github.out" || fail 'unchanged version not reported'
-UPDATE_TEST_INSTALLED_VERSION="2.10.5"
+grep -Fq "仍是版本 ${VERSION}" "$tmp/github.out" || fail 'unchanged version not reported'
+UPDATE_TEST_INSTALLED_VERSION="2.10.6"
 update_command >"$tmp/newer.out" || fail 'newer version update failed'
-grep -q '已从 2.10.4 更新到 2.10.5' "$tmp/newer.out" || fail 'new version not reported'
+grep -Fq "已从 ${VERSION} 更新到 ${UPDATE_TEST_INSTALLED_VERSION}" "$tmp/newer.out" || fail 'new version not reported'
 
 download_update_installer() {
   if [[ "$1" == *'/commits/main?'* ]]; then printf '{"sha":"%s"}\n' "$UPDATE_TEST_SHA" >"$2"; else printf 'not a shell installer\n' >"$2"; fi
