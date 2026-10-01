@@ -29,7 +29,7 @@ update_command >"$tmp/github.out" 2>&1 || fail 'GitHub update failed'
 grep -q "https://api.github.com/repos/dingding229/bbr-tune/commits/main?bbr_tune_refresh=" "$tmp/download-urls" || fail 'GitHub commit API not used'
 grep -q "https://raw.githubusercontent.com/dingding229/bbr-tune/${UPDATE_TEST_SHA}/install.sh?bbr_tune_refresh=" "$tmp/download-urls" || fail 'GitHub installer not pinned to commit'
 grep -Fq "仍是版本 ${VERSION}" "$tmp/github.out" || fail 'unchanged version not reported'
-UPDATE_TEST_INSTALLED_VERSION="2.10.6"
+UPDATE_TEST_INSTALLED_VERSION="${VERSION%.*}.$(( ${VERSION##*.} + 1 ))"
 update_command >"$tmp/newer.out" || fail 'newer version update failed'
 grep -Fq "已从 ${VERSION} 更新到 ${UPDATE_TEST_INSTALLED_VERSION}" "$tmp/newer.out" || fail 'new version not reported'
 
